@@ -12,27 +12,41 @@ class AudioProcessor:
     def __init__(self, feature_extractor_path="openai/whisper-tiny/"):
         self.feature_extractor = AutoFeatureExtractor.from_pretrained(feature_extractor_path)
 
-    def get_audio_feature(self, wav_path, start_index=0, weight_dtype=None):
-        if not os.path.exists(wav_path):
-            return None
-        librosa_output, sampling_rate = librosa.load(wav_path, sr=16000)
-        assert sampling_rate == 16000
-        # Split audio into 30s segments
-        segment_length = 30 * sampling_rate
-        segments = [librosa_output[i:i + segment_length] for i in range(0, len(librosa_output), segment_length)]
-
+    def _extract_features_from_wave(self, wave_16k: np.ndarray, weight_dtype=None):
+        segment_length = 30 * 16000
+        segments = [wave_16k[i:i + segment_length] for i in range(0, len(wave_16k), segment_length)]
         features = []
         for segment in segments:
             audio_feature = self.feature_extractor(
                 segment,
                 return_tensors="pt",
-                sampling_rate=sampling_rate
+                sampling_rate=16000
             ).input_features
             if weight_dtype is not None:
                 audio_feature = audio_feature.to(dtype=weight_dtype)
             features.append(audio_feature)
+        return features
 
+    def get_audio_feature(self, wav_path, start_index=0, weight_dtype=None):
+        if not os.path.exists(wav_path):
+            return None
+        del start_index
+        librosa_output, sampling_rate = librosa.load(wav_path, sr=16000)
+        assert sampling_rate == 16000
+        features = self._extract_features_from_wave(librosa_output, weight_dtype=weight_dtype)
         return features, len(librosa_output)
+
+    def get_audio_feature_from_array(self, audio_wave: np.ndarray, sample_rate: int, weight_dtype=None):
+        if audio_wave is None:
+            return None
+        if audio_wave.size == 0:
+            return None
+        if sample_rate != 16000:
+            audio_wave = librosa.resample(audio_wave.astype(np.float32), orig_sr=sample_rate, target_sr=16000)
+            sample_rate = 16000
+        assert sample_rate == 16000
+        features = self._extract_features_from_wave(audio_wave, weight_dtype=weight_dtype)
+        return features, len(audio_wave)
 
     def get_whisper_chunk(
         self,
@@ -99,4 +113,3 @@ if __name__ == "__main__":
     audio_feature, librosa_feature_length = audio_processor.get_audio_feature(wav_path)
     print("Audio Feature shape:", audio_feature.shape)
     print("librosa_feature_length:", librosa_feature_length)
-
