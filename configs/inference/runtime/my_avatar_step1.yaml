@@ -1,0 +1,6 @@
+my_avatar:
+  preparation: true
+  bbox_shift: 0
+  video_path: /teamspace/studios/this_studio/video.mp4
+  audio_clips:
+    audio_0: /teamspace/studios/this_studio/audio.wav

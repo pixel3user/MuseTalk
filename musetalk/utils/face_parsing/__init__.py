@@ -59,12 +59,18 @@ class FaceParsing():
     def model_init(self, 
                    resnet_path='./models/face-parse-bisent/resnet18-5c106cde.pth', 
                    model_pth='./models/face-parse-bisent/79999_iter.pth'):
+        def _safe_torch_load(path, map_location=None):
+            try:
+                return torch.load(path, map_location=map_location, weights_only=False)
+            except TypeError:
+                return torch.load(path, map_location=map_location)
+
         net = BiSeNet(resnet_path)
         if torch.cuda.is_available():
             net.cuda()
-            net.load_state_dict(torch.load(model_pth)) 
+            net.load_state_dict(_safe_torch_load(model_pth))
         else:
-            net.load_state_dict(torch.load(model_pth, map_location=torch.device('cpu')))
+            net.load_state_dict(_safe_torch_load(model_pth, map_location=torch.device('cpu')))
         net.eval()
         return net
 

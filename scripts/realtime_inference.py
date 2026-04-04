@@ -14,7 +14,7 @@ from transformers import WhisperModel
 
 from musetalk.utils.face_parsing import FaceParsing
 from musetalk.utils.utils import datagen
-from musetalk.utils.preprocessing import get_landmark_and_bbox, read_imgs
+from musetalk.utils.preprocessing import get_landmark_and_bbox, read_imgs, MMPOSE_AVAILABLE
 from musetalk.utils.blending import get_image_prepare_material, get_image_blending
 from musetalk.utils.utils import load_all_model
 from musetalk.utils.audio_processor import AudioProcessor
@@ -87,15 +87,15 @@ class Avatar:
     def init(self):
         if self.preparation:
             if os.path.exists(self.avatar_path):
-                response = input(f"{self.avatar_id} exists, Do you want to re-create it ? (y/n)")
-                if response.lower() == "y":
+                if args.force_recreate_avatar:
                     shutil.rmtree(self.avatar_path)
                     print("*********************************")
                     print(f"  creating avator: {self.avatar_id}")
                     print("*********************************")
                     osmakedirs([self.avatar_path, self.full_imgs_path, self.video_out_path, self.mask_out_path])
                     self.prepare_material()
-                else:
+                elif args.non_interactive:
+                    print(f"{self.avatar_id} exists, reusing cached avatar materials (non-interactive mode).")
                     self.input_latent_list_cycle = torch.load(self.latents_out_path)
                     with open(self.coords_path, 'rb') as f:
                         self.coord_list_cycle = pickle.load(f)
@@ -107,6 +107,27 @@ class Avatar:
                     input_mask_list = glob.glob(os.path.join(self.mask_out_path, '*.[jpJP][pnPN]*[gG]'))
                     input_mask_list = sorted(input_mask_list, key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
                     self.mask_list_cycle = read_imgs(input_mask_list)
+                else:
+                    response = input(f"{self.avatar_id} exists, Do you want to re-create it ? (y/n)")
+                    if response.lower() == "y":
+                        shutil.rmtree(self.avatar_path)
+                        print("*********************************")
+                        print(f"  creating avator: {self.avatar_id}")
+                        print("*********************************")
+                        osmakedirs([self.avatar_path, self.full_imgs_path, self.video_out_path, self.mask_out_path])
+                        self.prepare_material()
+                    else:
+                        self.input_latent_list_cycle = torch.load(self.latents_out_path)
+                        with open(self.coords_path, 'rb') as f:
+                            self.coord_list_cycle = pickle.load(f)
+                        input_img_list = glob.glob(os.path.join(self.full_imgs_path, '*.[jpJP][pnPN]*[gG]'))
+                        input_img_list = sorted(input_img_list, key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
+                        self.frame_list_cycle = read_imgs(input_img_list)
+                        with open(self.mask_coords_path, 'rb') as f:
+                            self.mask_coords_list_cycle = pickle.load(f)
+                        input_mask_list = glob.glob(os.path.join(self.mask_out_path, '*.[jpJP][pnPN]*[gG]'))
+                        input_mask_list = sorted(input_mask_list, key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
+                        self.mask_list_cycle = read_imgs(input_mask_list)
             else:
                 print("*********************************")
                 print(f"  creating avator: {self.avatar_id}")
@@ -122,8 +143,7 @@ class Avatar:
                 avatar_info = json.load(f)
 
             if avatar_info['bbox_shift'] != self.avatar_info['bbox_shift']:
-                response = input(f" 【bbox_shift】 is changed, you need to re-create it ! (c/continue)")
-                if response.lower() == "c":
+                if args.force_recreate_avatar or args.non_interactive:
                     shutil.rmtree(self.avatar_path)
                     print("*********************************")
                     print(f"  creating avator: {self.avatar_id}")
@@ -131,7 +151,16 @@ class Avatar:
                     osmakedirs([self.avatar_path, self.full_imgs_path, self.video_out_path, self.mask_out_path])
                     self.prepare_material()
                 else:
-                    sys.exit()
+                    response = input(f" 【bbox_shift】 is changed, you need to re-create it ! (c/continue)")
+                    if response.lower() == "c":
+                        shutil.rmtree(self.avatar_path)
+                        print("*********************************")
+                        print(f"  creating avator: {self.avatar_id}")
+                        print("*********************************")
+                        osmakedirs([self.avatar_path, self.full_imgs_path, self.video_out_path, self.mask_out_path])
+                        self.prepare_material()
+                    else:
+                        sys.exit()
             else:
                 self.input_latent_list_cycle = torch.load(self.latents_out_path)
                 with open(self.coords_path, 'rb') as f:
@@ -339,6 +368,22 @@ if __name__ == "__main__":
                        action="store_true",
                        help="Whether skip saving images for better generation speed calculation",
                        )
+    parser.add_argument("--non_interactive",
+                        action="store_true",
+                        help="Disable interactive prompts and use deterministic behavior.",
+                        )
+    parser.add_argument("--force_recreate_avatar",
+                        action="store_true",
+                        help="When avatar cache exists, always recreate it.",
+                        )
+    parser.add_argument("--use_fp16",
+                        action="store_true",
+                        help="Use fp16 on GPU for speed. Default is fp32 for better quality.",
+                        )
+    parser.add_argument("--require_mmpose",
+                        action="store_true",
+                        help="Fail fast if mmpose/DWPose is unavailable (recommended for best quality).",
+                        )
 
     args = parser.parse_args()
 
@@ -354,6 +399,13 @@ if __name__ == "__main__":
     # Set computing device
     device = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu")
 
+    if args.require_mmpose and not MMPOSE_AVAILABLE:
+        raise RuntimeError(
+            "mmpose/DWPose is required but unavailable. Install mmpose and add models/dwpose/dw-ll_ucoco_384.pth."
+        )
+    if not MMPOSE_AVAILABLE:
+        print("[WARN] mmpose is unavailable; using face-detector fallback. Mouth alignment quality can be lower.")
+
     # Load model weights
     vae, unet, pe = load_all_model(
         unet_model_path=args.unet_model_path,
@@ -363,9 +415,19 @@ if __name__ == "__main__":
     )
     timesteps = torch.tensor([0], device=device)
 
-    pe = pe.half().to(device)
-    vae.vae = vae.vae.half().to(device)
-    unet.model = unet.model.half().to(device)
+    if device.type == "cuda" and args.use_fp16:
+        pe = pe.half().to(device)
+        vae.vae = vae.vae.half().to(device)
+        unet.model = unet.model.half().to(device)
+        print("[INFO] Precision mode: fp16 (GPU)")
+    else:
+        pe = pe.float().to(device)
+        vae.vae = vae.vae.float().to(device)
+        unet.model = unet.model.float().to(device)
+        if device.type == "cuda":
+            print("[INFO] Precision mode: fp32 (GPU, quality mode)")
+        else:
+            print("[INFO] Precision mode: fp32 (CPU)")
 
     # Initialize audio processor and Whisper model
     audio_processor = AudioProcessor(feature_extractor_path=args.whisper_dir)
@@ -389,10 +451,7 @@ if __name__ == "__main__":
     for avatar_id in inference_config:
         data_preparation = inference_config[avatar_id]["preparation"]
         video_path = inference_config[avatar_id]["video_path"]
-        if args.version == "v15":
-            bbox_shift = 0
-        else:
-            bbox_shift = inference_config[avatar_id]["bbox_shift"]
+        bbox_shift = inference_config[avatar_id].get("bbox_shift", args.bbox_shift)
         avatar = Avatar(
             avatar_id=avatar_id,
             video_path=video_path,
