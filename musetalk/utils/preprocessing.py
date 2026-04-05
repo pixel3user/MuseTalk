@@ -13,6 +13,10 @@ import json
 import torch
 from tqdm import tqdm
 
+# PyTorch >=2.6 defaults torch.load(weights_only=True), which breaks older DWPose
+# checkpoints loaded via mmengine/mmpose. Force legacy behavior for this process.
+os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
+
 MMPOSE_AVAILABLE = False
 model = None
 inference_topdown = None

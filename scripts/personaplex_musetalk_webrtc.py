@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import contextlib
+import fractions
 import json
 import time
 from dataclasses import dataclass
@@ -10,24 +11,27 @@ from urllib.parse import urlencode
 
 import aiohttp
 import cv2
-import librosa
 import numpy as np
 import sphn
 import torch
 from aiohttp import web
+from scipy.signal import resample_poly
 
 try:
     import av
-    from aiortc import RTCPeerConnection, RTCSessionDescription
-    from aiortc.mediastreams import AudioStreamTrack, VideoStreamTrack
+    from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription
+    from aiortc.mediastreams import AudioStreamTrack, MediaStreamError, VideoStreamTrack
 
     AIORTC_AVAILABLE = True
 except Exception:
     AIORTC_AVAILABLE = False
     av = None
+    RTCConfiguration = None
+    RTCIceServer = None
     RTCPeerConnection = None
     RTCSessionDescription = None
     AudioStreamTrack = object
+    MediaStreamError = RuntimeError
     VideoStreamTrack = object
 
 
@@ -46,15 +50,37 @@ HTML_PAGE = """<!doctype html>
   <div style="padding:0 12px 12px 12px">
     <button id="start">Start</button>
     <span id="state" style="margin-left:8px">idle</span>
+    <div id="dbg" style="margin-top:8px;font-size:12px;white-space:pre-wrap;color:#b0b0b0"></div>
   </div>
 <script>
 let pc = null;
+async function waitIceGatheringComplete(pc, timeoutMs = 4000) {
+  if (pc.iceGatheringState === 'complete') return;
+  await new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      pc.removeEventListener('icegatheringstatechange', onState);
+      resolve();
+    };
+    const onState = () => {
+      if (pc.iceGatheringState === 'complete') finish();
+    };
+    pc.addEventListener('icegatheringstatechange', onState);
+    setTimeout(finish, timeoutMs);
+  });
+}
 async function start() {
   const state = document.getElementById('state');
   state.textContent = 'connecting';
-  pc = new RTCPeerConnection();
+  const rtcCfg = await (await fetch('/config')).json();
+  pc = new RTCPeerConnection(rtcCfg);
   pc.addTransceiver('video', { direction: 'recvonly' });
   pc.addTransceiver('audio', { direction: 'recvonly' });
+  pc.onconnectionstatechange = () => {
+    state.textContent = pc.connectionState;
+  };
   pc.ontrack = (ev) => {
     if (ev.track.kind === 'video') {
       document.getElementById('v').srcObject = ev.streams[0];
@@ -64,6 +90,8 @@ async function start() {
   };
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
+  // Non-trickle flow: wait for ICE gathering so TURN/relay candidates are included.
+  await waitIceGatheringComplete(pc, 5000);
   const resp = await fetch('/offer', {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
@@ -71,9 +99,14 @@ async function start() {
   });
   const answer = await resp.json();
   await pc.setRemoteDescription(answer);
-  state.textContent = 'connected';
 }
 document.getElementById('start').onclick = start;
+setInterval(async () => {
+  try {
+    const s = await (await fetch('/status')).json();
+    document.getElementById('dbg').textContent = JSON.stringify(s, null, 2);
+  } catch (e) {}
+}, 1000);
 </script>
 </body>
 </html>
@@ -84,6 +117,10 @@ document.getElementById('start').onclick = start;
 class AppArgs:
     host: str
     port: int
+    ice_servers: list[str]
+    ice_transport_policy: str
+    ice_username: str
+    ice_credential: str
     personaplex_host: str
     personaplex_port: int
     personaplex_path: str
@@ -113,6 +150,9 @@ class AppArgs:
     window_ms: int
     hop_ms: int
     min_window_ms: int
+    max_advance_ms: int
+    max_tail_frames: int
+    mouth_smoothing_alpha: float
     video_queue_size: int
     status_json: Optional[Path]
     reconnect_delay_seconds: float
@@ -191,18 +231,26 @@ class VideoFrameBuffer:
         except asyncio.TimeoutError:
             return self.last_frame
 
+    def snapshot_jpeg(self) -> bytes:
+        ok, enc = cv2.imencode(".jpg", self.last_frame)
+        if not ok:
+            return b""
+        return enc.tobytes()
+
 
 class PersonaPlexMirrorClient:
     def __init__(
         self,
         ws_url: str,
         pcm_ring_24k: PcmRingBuffer,
+        pcm_ring_16k: PcmRingBuffer,
         audio_track_buffer: AudioTrackBuffer,
         status_json: Optional[Path],
         reconnect_delay_seconds: float,
     ):
         self.ws_url = ws_url
         self.ring = pcm_ring_24k
+        self.ring16k = pcm_ring_16k
         self.audio_track_buffer = audio_track_buffer
         self.reader = sphn.OpusStreamReader(24000)
         self.status_json = status_json
@@ -256,6 +304,9 @@ class PersonaPlexMirrorClient:
                                 continue
                             pcm = np.asarray(pcm, dtype=np.float32).reshape(-1)
                             await self.ring.append(pcm)
+                            # Fast incremental 24k -> 16k conversion (2/3) for inference path.
+                            pcm16k = resample_poly(pcm, up=2, down=3).astype(np.float32, copy=False)
+                            await self.ring16k.append(pcm16k)
                             await self.audio_track_buffer.append_from_24k(pcm)
                             self.decoded_seconds += pcm.size / 24000.0
                             self.last_rx_epoch = time.time()
@@ -271,18 +322,20 @@ class MuseTalkRealtimeEngine:
     def __init__(
         self,
         args: AppArgs,
-        pcm_ring_24k: PcmRingBuffer,
+        pcm_ring_16k: PcmRingBuffer,
         video_buffer: VideoFrameBuffer,
     ):
         self.args = args
-        self.pcm_ring = pcm_ring_24k
+        self.pcm_ring = pcm_ring_16k
         self.video_buffer = video_buffer
         self.stop_event = asyncio.Event()
         self.last_total_samples = -1
         self.avatar_frame_idx = 0
         self.jobs = 0
+        self.dropped_audio_ms_total = 0.0
         self.last_publish_epoch = 0.0
         self.last_error = ""
+        self.prev_mouth_patch = None
 
         import scripts.realtime_inference as rt
 
@@ -295,6 +348,12 @@ class MuseTalkRealtimeEngine:
             batch_size=args.batch_size,
             preparation=False,
         )
+        # Seed a non-black idle frame so preview is visible before first audio packets arrive.
+        if getattr(self.avatar, "frame_list_cycle", None):
+            try:
+                self.video_buffer.last_frame = self.avatar.frame_list_cycle[0].copy()
+            except Exception:
+                pass
 
     def _setup_runtime(self) -> None:
         rt = self.rt
@@ -366,11 +425,10 @@ class MuseTalkRealtimeEngine:
         else:
             rt.fp = rt.FaceParsing()
 
-    def _infer_window_frames(self, pcm24k_window: np.ndarray, new_frames: int) -> list[np.ndarray]:
+    def _infer_window_frames(self, pcm16k_window: np.ndarray, new_frames: int) -> list[np.ndarray]:
         rt = self.rt
-        audio16k = librosa.resample(pcm24k_window.astype(np.float32), orig_sr=24000, target_sr=16000)
         feature_ret = rt.audio_processor.get_audio_feature_from_array(
-            audio16k, sample_rate=16000, weight_dtype=rt.weight_dtype
+            pcm16k_window, sample_rate=16000, weight_dtype=rt.weight_dtype
         )
         if feature_ret is None:
             return []
@@ -411,6 +469,18 @@ class MuseTalkRealtimeEngine:
                 mask = self.avatar.mask_list_cycle[base_i]
                 mask_box = self.avatar.mask_coords_list_cycle[base_i]
                 frame = rt.get_image_blending(ori_frame, lip, bbox, mask, mask_box)
+                # Temporal smoothing on the mouth patch reduces flicker/chin artifacts.
+                if 0.0 <= self.args.mouth_smoothing_alpha < 1.0:
+                    x1c = max(0, min(frame.shape[1] - 1, x1))
+                    x2c = max(1, min(frame.shape[1], x2))
+                    y1c = max(0, min(frame.shape[0] - 1, y1))
+                    y2c = max(1, min(frame.shape[0], y2))
+                    cur = frame[y1c:y2c, x1c:x2c]
+                    if self.prev_mouth_patch is not None and self.prev_mouth_patch.shape == cur.shape:
+                        alpha = float(self.args.mouth_smoothing_alpha)
+                        cur = cv2.addWeighted(cur, alpha, self.prev_mouth_patch, 1.0 - alpha, 0.0)
+                        frame[y1c:y2c, x1c:x2c] = cur
+                    self.prev_mouth_patch = frame[y1c:y2c, x1c:x2c].copy()
                 combined_frames.append(frame)
                 self.avatar_frame_idx += 1
 
@@ -421,8 +491,9 @@ class MuseTalkRealtimeEngine:
         return combined_frames[-new_frames:]
 
     async def run(self) -> None:
-        window_samples = int((self.args.window_ms / 1000.0) * 24000)
-        min_samples = int((self.args.min_window_ms / 1000.0) * 24000)
+        window_samples = int((self.args.window_ms / 1000.0) * 16000)
+        min_samples = int((self.args.min_window_ms / 1000.0) * 16000)
+        max_advance_samples = int((self.args.max_advance_ms / 1000.0) * 16000)
         hop_seconds = self.args.hop_ms / 1000.0
         while not self.stop_event.is_set():
             await asyncio.sleep(max(0.02, hop_seconds))
@@ -438,8 +509,14 @@ class MuseTalkRealtimeEngine:
                 new_samples = max(1, int(total - self.last_total_samples))
             self.last_total_samples = total
 
+            if max_advance_samples > 0 and new_samples > max_advance_samples:
+                dropped = (new_samples - max_advance_samples) * 1000.0 / 16000.0
+                self.dropped_audio_ms_total += dropped
+                new_samples = max_advance_samples
+
             # Fixes "same lips over and over" by publishing only newly advanced tail frames.
-            new_frames = max(1, int(round((new_samples / 24000.0) * self.args.fps)))
+            new_frames = max(1, int(round((new_samples / 16000.0) * self.args.fps)))
+            new_frames = min(new_frames, max(1, self.args.max_tail_frames))
             try:
                 frames = await asyncio.to_thread(self._infer_window_frames, window, new_frames)
                 for frame in frames:
@@ -457,15 +534,17 @@ class MuseTalkRealtimeEngine:
             "last_publish_epoch": self.last_publish_epoch or None,
             "last_error": self.last_error or None,
             "avatar_frame_idx": self.avatar_frame_idx,
+            "dropped_audio_ms_total": round(self.dropped_audio_ms_total, 1),
         }
 
 
 class MuseTalkVideoTrack(VideoStreamTrack):
-    def __init__(self, buffer: VideoFrameBuffer, fps: int):
+    def __init__(self, buffer: VideoFrameBuffer, fps: int, stats: dict):
         super().__init__()
         self.buffer = buffer
         self.fps = max(1, fps)
         self.frame_interval = 1.0 / self.fps
+        self.stats = stats
 
     async def recv(self):
         if not AIORTC_AVAILABLE:
@@ -475,26 +554,44 @@ class MuseTalkVideoTrack(VideoStreamTrack):
         pts, time_base = await self.next_timestamp()
         video_frame.pts = pts
         video_frame.time_base = time_base
+        self.stats["video_frames_sent"] = self.stats.get("video_frames_sent", 0) + 1
+        self.stats["last_video_send_epoch"] = time.time()
         return video_frame
 
 
 class MuseTalkAudioTrack(AudioStreamTrack):
-    def __init__(self, audio_buffer: AudioTrackBuffer):
+    def __init__(self, audio_buffer: AudioTrackBuffer, stats: dict):
         super().__init__()
         self.audio_buffer = audio_buffer
         self.samples_per_frame = 960  # 20ms @ 48kHz
+        self.sample_rate = 48000
+        self.stats = stats
 
     async def recv(self):
         if not AIORTC_AVAILABLE:
             raise RuntimeError("aiortc/av is not installed")
+        if self.readyState != "live":
+            raise MediaStreamError
         pcm = await self.audio_buffer.pop_48k(self.samples_per_frame)
         pcm_i16 = (np.clip(pcm, -1.0, 1.0) * 32767.0).astype(np.int16)
+
+        # AudioStreamTrack in aiortc does not provide next_timestamp() (video-only helper),
+        # so we keep our own 48k clock here.
+        if hasattr(self, "_timestamp"):
+            self._timestamp += self.samples_per_frame
+            wait = self._start + (self._timestamp / self.sample_rate) - time.time()
+            await asyncio.sleep(max(0.0, wait))
+        else:
+            self._start = time.time()
+            self._timestamp = 0
+
         frame = av.AudioFrame(format="s16", layout="mono", samples=self.samples_per_frame)
         frame.sample_rate = 48000
         frame.planes[0].update(pcm_i16.tobytes())
-        pts, time_base = await self.next_timestamp()
-        frame.pts = pts
-        frame.time_base = time_base
+        frame.pts = self._timestamp
+        frame.time_base = fractions.Fraction(1, self.sample_rate)
+        self.stats["audio_frames_sent"] = self.stats.get("audio_frames_sent", 0) + 1
+        self.stats["last_audio_send_epoch"] = time.time()
         return frame
 
 
@@ -502,9 +599,17 @@ class WebRtcApp:
     def __init__(self, args: AppArgs):
         self.args = args
         self.pcs = set()
+        self.pc_states = {}
+        self.track_stats = {
+            "video_frames_sent": 0,
+            "audio_frames_sent": 0,
+            "last_video_send_epoch": 0.0,
+            "last_audio_send_epoch": 0.0,
+        }
 
         ring_samples = int(args.ring_buffer_seconds * 24000)
         self.pcm_ring_24k = PcmRingBuffer(max_samples=ring_samples)
+        self.pcm_ring_16k = PcmRingBuffer(max_samples=int(args.ring_buffer_seconds * 16000))
         self.audio_track_buffer = AudioTrackBuffer(max_samples_48k=int(args.ring_buffer_seconds * 48000))
         self.video_buffer = VideoFrameBuffer(maxsize=args.video_queue_size)
 
@@ -512,18 +617,46 @@ class WebRtcApp:
         self.mirror_client = PersonaPlexMirrorClient(
             ws_url=ws_url,
             pcm_ring_24k=self.pcm_ring_24k,
+            pcm_ring_16k=self.pcm_ring_16k,
             audio_track_buffer=self.audio_track_buffer,
             status_json=args.status_json,
             reconnect_delay_seconds=args.reconnect_delay_seconds,
         )
         self.engine = MuseTalkRealtimeEngine(
             args=args,
-            pcm_ring_24k=self.pcm_ring_24k,
+            pcm_ring_16k=self.pcm_ring_16k,
             video_buffer=self.video_buffer,
         )
 
         self.mirror_task: Optional[asyncio.Task] = None
         self.engine_task: Optional[asyncio.Task] = None
+
+    def _aiortc_ice_servers(self):
+        servers = []
+        for url in self.args.ice_servers:
+            if not str(url).strip():
+                continue
+            with contextlib.suppress(Exception):
+                kw = {"urls": url}
+                if self.args.ice_username and str(url).lower().startswith(("turn:", "turns:")):
+                    kw["username"] = self.args.ice_username
+                if self.args.ice_credential and str(url).lower().startswith(("turn:", "turns:")):
+                    kw["credential"] = self.args.ice_credential
+                servers.append(RTCIceServer(**kw))
+        return servers
+
+    def _browser_rtc_config(self) -> dict:
+        servers = []
+        for url in self.args.ice_servers:
+            if not str(url).strip():
+                continue
+            entry = {"urls": url}
+            if self.args.ice_username and str(url).lower().startswith(("turn:", "turns:")):
+                entry["username"] = self.args.ice_username
+            if self.args.ice_credential and str(url).lower().startswith(("turn:", "turns:")):
+                entry["credential"] = self.args.ice_credential
+            servers.append(entry)
+        return {"iceServers": servers, "iceTransportPolicy": self.args.ice_transport_policy}
 
     def _build_mirror_ws_url(self) -> str:
         path = self.args.personaplex_path
@@ -561,6 +694,9 @@ class WebRtcApp:
     async def index(self, _request: web.Request) -> web.Response:
         return web.Response(text=HTML_PAGE, content_type="text/html")
 
+    async def config(self, _request: web.Request) -> web.Response:
+        return web.json_response(self._browser_rtc_config())
+
     async def status(self, _request: web.Request) -> web.Response:
         payload = {
             "mirror": {
@@ -570,8 +706,23 @@ class WebRtcApp:
                 "last_rx_epoch": self.mirror_client.last_rx_epoch or None,
             },
             "engine": self.engine.status(),
+            "webrtc": {
+                "peer_count": len(self.pcs),
+                "peer_states": self.pc_states,
+                "track_stats": self.track_stats,
+                "ice": {
+                    "servers": self.args.ice_servers,
+                    "transport_policy": self.args.ice_transport_policy,
+                },
+            },
         }
         return web.json_response(payload)
+
+    async def snapshot(self, _request: web.Request) -> web.Response:
+        data = self.video_buffer.snapshot_jpeg()
+        if not data:
+            return web.Response(status=503, text="snapshot unavailable")
+        return web.Response(body=data, content_type="image/jpeg")
 
     async def offer(self, request: web.Request) -> web.Response:
         if not AIORTC_AVAILABLE:
@@ -582,34 +733,54 @@ class WebRtcApp:
         params = await request.json()
         offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
 
-        pc = RTCPeerConnection()
+        pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=self._aiortc_ice_servers()))
         self.pcs.add(pc)
+        pcid = f"pc_{id(pc)}"
+        self.pc_states[pcid] = pc.connectionState
 
         @pc.on("connectionstatechange")
         async def on_connectionstatechange():
+            self.pc_states[pcid] = pc.connectionState
             if pc.connectionState in ("failed", "closed", "disconnected"):
                 await pc.close()
                 self.pcs.discard(pc)
+                self.pc_states[pcid] = "closed"
 
-        video_track = MuseTalkVideoTrack(self.video_buffer, fps=self.args.fps)
-        audio_track = MuseTalkAudioTrack(self.audio_track_buffer)
+        video_track = MuseTalkVideoTrack(self.video_buffer, fps=self.args.fps, stats=self.track_stats)
+        audio_track = MuseTalkAudioTrack(self.audio_track_buffer, stats=self.track_stats)
         pc.addTrack(video_track)
         pc.addTrack(audio_track)
 
         await pc.setRemoteDescription(offer)
         answer = await pc.createAnswer()
         await pc.setLocalDescription(answer)
+        await self._wait_for_ice_gathering(pc, timeout=3.0)
 
         return web.json_response(
             {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
         )
+
+    async def _wait_for_ice_gathering(self, pc: RTCPeerConnection, timeout: float) -> None:
+        if pc.iceGatheringState == "complete":
+            return
+        done = asyncio.Event()
+
+        @pc.on("icegatheringstatechange")
+        async def _on_ice_state_change():
+            if pc.iceGatheringState == "complete":
+                done.set()
+
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(done.wait(), timeout=timeout)
 
     def build_app(self) -> web.Application:
         app = web.Application()
         app.on_startup.append(self.on_startup)
         app.on_cleanup.append(self.on_cleanup)
         app.router.add_get("/", self.index)
+        app.router.add_get("/config", self.config)
         app.router.add_get("/status", self.status)
+        app.router.add_get("/snapshot.jpg", self.snapshot)
         app.router.add_post("/offer", self.offer)
         return app
 
@@ -620,6 +791,21 @@ def parse_args() -> AppArgs:
     )
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8780)
+    parser.add_argument(
+        "--ice-server",
+        action="append",
+        default=["stun:stun.l.google.com:19302"],
+        help="ICE server URL. Repeat flag for multiple entries (stun:..., turn:..., turns:...).",
+    )
+    parser.add_argument(
+        "--ice-transport-policy",
+        type=str,
+        default="all",
+        choices=["all", "relay"],
+        help="Use 'relay' to force TURN relay candidates only.",
+    )
+    parser.add_argument("--ice-username", type=str, default="", help="ICE username for TURN auth.")
+    parser.add_argument("--ice-credential", type=str, default="", help="ICE credential/password for TURN auth.")
 
     parser.add_argument("--personaplex-host", type=str, default="127.0.0.1")
     parser.add_argument("--personaplex-port", type=int, default=8998)
@@ -633,8 +819,8 @@ def parse_args() -> AppArgs:
     parser.add_argument("--gpu-id", type=int, default=0)
     parser.add_argument("--use-fp16", action="store_true")
     parser.add_argument("--require-mmpose", action="store_true")
-    parser.add_argument("--fps", type=int, default=25)
-    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--fps", type=int, default=20)
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--bbox-shift", type=int, default=0)
     parser.add_argument("--unet-model-path", type=str, default="models/musetalkV15/unet.pth")
     parser.add_argument("--unet-config", type=str, default="models/musetalkV15/musetalk.json")
@@ -648,10 +834,18 @@ def parse_args() -> AppArgs:
     parser.add_argument("--audio-padding-length-left", type=int, default=2)
     parser.add_argument("--audio-padding-length-right", type=int, default=2)
 
-    parser.add_argument("--ring-buffer-seconds", type=float, default=12.0)
-    parser.add_argument("--window-ms", type=int, default=640)
-    parser.add_argument("--hop-ms", type=int, default=80)
-    parser.add_argument("--min-window-ms", type=int, default=320)
+    parser.add_argument("--ring-buffer-seconds", type=float, default=8.0)
+    parser.add_argument("--window-ms", type=int, default=400)
+    parser.add_argument("--hop-ms", type=int, default=60)
+    parser.add_argument("--min-window-ms", type=int, default=240)
+    parser.add_argument("--max-advance-ms", type=int, default=180)
+    parser.add_argument("--max-tail-frames", type=int, default=3)
+    parser.add_argument(
+        "--mouth-smoothing-alpha",
+        type=float,
+        default=0.7,
+        help="0..1. Lower values smooth more but can reduce lip sharpness.",
+    )
     parser.add_argument("--video-queue-size", type=int, default=256)
     parser.add_argument("--reconnect-delay-seconds", type=float, default=1.0)
     parser.add_argument(
@@ -666,6 +860,10 @@ def parse_args() -> AppArgs:
     return AppArgs(
         host=ns.host,
         port=ns.port,
+        ice_servers=ns.ice_server,
+        ice_transport_policy=ns.ice_transport_policy,
+        ice_username=ns.ice_username,
+        ice_credential=ns.ice_credential,
         personaplex_host=ns.personaplex_host,
         personaplex_port=ns.personaplex_port,
         personaplex_path=ns.personaplex_path,
@@ -695,6 +893,9 @@ def parse_args() -> AppArgs:
         window_ms=ns.window_ms,
         hop_ms=ns.hop_ms,
         min_window_ms=ns.min_window_ms,
+        max_advance_ms=ns.max_advance_ms,
+        max_tail_frames=ns.max_tail_frames,
+        mouth_smoothing_alpha=ns.mouth_smoothing_alpha,
         video_queue_size=ns.video_queue_size,
         status_json=status_json,
         reconnect_delay_seconds=ns.reconnect_delay_seconds,

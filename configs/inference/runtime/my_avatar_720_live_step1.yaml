@@ -1,0 +1,6 @@
+my_avatar_720_live:
+  preparation: true
+  bbox_shift: 0
+  video_path: /teamspace/studios/this_studio/avatar_720p25.mp4
+  audio_clips:
+    audio_0: /teamspace/studios/this_studio/audio.wav
