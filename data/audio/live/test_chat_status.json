@@ -1,0 +1,8 @@
+{
+  "ws_url": "ws://127.0.0.1:8998/api/chat?text_prompt=You+are+concise&voice_prompt=NATF0.pt",
+  "chunk_path": "/teamspace/studios/this_studio/MuseTalk/data/audio/live/test_chat_chunk.wav",
+  "audio_packets": 0,
+  "decoded_seconds": 0.0,
+  "chunk_index": 0,
+  "last_audio_rx_epoch": null
+}

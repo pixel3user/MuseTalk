@@ -1,0 +1,8 @@
+{
+  "ws_url": "ws://127.0.0.1:8998/api/avatar/audio",
+  "chunk_path": "/teamspace/studios/this_studio/MuseTalk/data/audio/live/latest_chunk.wav",
+  "audio_packets": 11095,
+  "decoded_seconds": 887.36,
+  "chunk_index": 4406,
+  "last_audio_rx_epoch": 1775330190.1875737
+}

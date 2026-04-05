@@ -1,0 +1,12 @@
+{
+  "avatar_id": "my_avatar",
+  "chunk_wav": "/teamspace/studios/this_studio/MuseTalk/data/audio/live/latest_chunk.wav",
+  "latest_jpeg": "/teamspace/studios/this_studio/MuseTalk/data/video/live/latest.jpg",
+  "jobs_done": 54,
+  "last_chunk_processed_epoch": 1775329973.8251452,
+  "last_jpeg_update_epoch": 1775329975.8327386,
+  "last_output_mp4": "results/v15/avatars/my_avatar/vid_output/live_000053.mp4",
+  "chunk_exists": true,
+  "jpeg_exists": true,
+  "last_error": null
+}

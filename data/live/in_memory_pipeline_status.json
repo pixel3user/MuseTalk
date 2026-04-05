@@ -1,0 +1,7 @@
+{
+  "ws_url": "ws://127.0.0.1:8998/api/avatar/audio?text_prompt=&voice_prompt=",
+  "connected": true,
+  "audio_packets": 948,
+  "decoded_seconds": 75.59999999999874,
+  "last_audio_rx_epoch": 1775375376.9001584
+}
