@@ -5,8 +5,6 @@ This adds a dedicated profile for your validated avatar:
 - audio sanity clip: `/teamspace/studios/this_studio/audio.wav`
 - avatar id: `my_avatar_720_live`
 
-No existing PersonaPlex/MuseTalk runtime files were modified.
-
 ## 1) Prepare avatar once (GPU)
 
 ```bash
@@ -30,23 +28,26 @@ ls -lh results/v15/avatars/my_avatar_720_live/coords.pkl
 ls -lh results/v15/avatars/my_avatar_720_live/mask_coords.pkl
 ```
 
-## 3) Run PersonaPlex + MuseTalk WebRTC (later, when ready)
+## 3) Run MuseTalk WebRTC API (single-session cloud mode)
 
-Start PersonaPlex in its own terminal first.
-
-Use the local source launcher (required for `/api/avatar/audio` mirror endpoint):
-
-```bash
-cd /teamspace/studios/this_studio/personaplex
-./run_personaplex_with_avatar_mirror.sh
-```
-
-Then:
+Default launcher now uses `INPUT_SOURCE=webrtc`, so laptop mic can directly drive lipsync.
 
 ```bash
 cd /teamspace/studios/this_studio/MuseTalk
 chmod +x scripts/run_my_avatar_720_live_webrtc.sh
 ./scripts/run_my_avatar_720_live_webrtc.sh
+```
+
+Optional API auth:
+
+```bash
+API_TOKEN="your-secret-token" ./scripts/run_my_avatar_720_live_webrtc.sh
+```
+
+If you want mirror audio from PersonaPlex instead, set:
+
+```bash
+INPUT_SOURCE=mirror ./scripts/run_my_avatar_720_live_webrtc.sh
 ```
 
 If WebRTC stays in `connecting` on cloud, run with TURN relay:
@@ -70,6 +71,7 @@ cd /teamspace/studios/this_studio/MuseTalk
 Open:
 - `http://<host>:8780/`
 - `http://<host>:8780/status`
+- `http://<host>:8780/healthz`
 
 ## Added files
 

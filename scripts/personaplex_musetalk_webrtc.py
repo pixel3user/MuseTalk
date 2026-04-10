@@ -8,7 +8,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlencode
 
 import aiohttp
@@ -51,11 +51,29 @@ HTML_PAGE = """<!doctype html>
   </div>
   <div style="padding:0 12px 12px 12px">
     <button id="start">Start</button>
+    <button id="stop" disabled>Stop</button>
     <span id="state" style="margin-left:8px">idle</span>
+    <div id="mic" style="margin-top:8px;font-size:12px;color:#8fd48f">mic: idle</div>
     <div id="dbg" style="margin-top:8px;font-size:12px;white-space:pre-wrap;color:#b0b0b0"></div>
   </div>
 <script>
 let pc = null;
+let localStream = null;
+let sessionId = null;
+let sessionToken = null;
+const startBtn = document.getElementById('start');
+const stopBtn = document.getElementById('stop');
+const stateEl = document.getElementById('state');
+const micEl = document.getElementById('mic');
+
+function setState(next) {
+  stateEl.textContent = next;
+}
+
+function setMic(next) {
+  micEl.textContent = 'mic: ' + next;
+}
+
 async function waitIceGatheringComplete(pc, timeoutMs = 4000) {
   if (pc.iceGatheringState === 'complete') return;
   await new Promise((resolve) => {
@@ -73,46 +91,148 @@ async function waitIceGatheringComplete(pc, timeoutMs = 4000) {
     setTimeout(finish, timeoutMs);
   });
 }
-async function start() {
-  const state = document.getElementById('state');
-  state.textContent = 'connecting';
-  const rtcCfg = await (await fetch('/config')).json();
-  pc = new RTCPeerConnection(rtcCfg);
-  pc.addTransceiver('video', { direction: 'recvonly' });
-  pc.addTransceiver('audio', { direction: 'recvonly' });
-  pc.onconnectionstatechange = () => {
-    state.textContent = pc.connectionState;
-  };
-  pc.ontrack = (ev) => {
-    if (ev.track.kind === 'video') {
-      document.getElementById('v').srcObject = ev.streams[0];
-    } else if (ev.track.kind === 'audio') {
-      document.getElementById('a').srcObject = ev.streams[0];
+
+async function cleanupPeer() {
+  if (pc) {
+    try { pc.ontrack = null; } catch (e) {}
+    try { pc.onconnectionstatechange = null; } catch (e) {}
+    try { pc.close(); } catch (e) {}
+    pc = null;
+  }
+  if (localStream) {
+    for (const track of localStream.getTracks()) {
+      try { track.stop(); } catch (e) {}
     }
-  };
-  const offer = await pc.createOffer();
-  await pc.setLocalDescription(offer);
-  // Non-trickle flow: wait for ICE gathering so TURN/relay candidates are included.
-  await waitIceGatheringComplete(pc, 5000);
-  const resp = await fetch('/offer', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type }),
-  });
-  const answer = await resp.json();
-  await pc.setRemoteDescription(answer);
+    localStream = null;
+  }
 }
-document.getElementById('start').onclick = start;
+
+async function cleanupSession() {
+  if (!sessionId || !sessionToken) {
+    sessionId = null;
+    sessionToken = null;
+    return;
+  }
+  try {
+    await fetch('/v1/sessions/' + sessionId, {
+      method: 'DELETE',
+      headers: { 'x-session-token': sessionToken },
+    });
+  } catch (e) {}
+  sessionId = null;
+  sessionToken = null;
+}
+
+async function start() {
+  if (pc) {
+    await stop();
+  }
+  startBtn.disabled = true;
+  stopBtn.disabled = false;
+  try {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      throw new Error('Browser does not support getUserMedia');
+    }
+    setState('requesting-mic');
+    setMic('requesting permission');
+
+    const rtcCfg = await (await fetch('/config')).json();
+    localStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+      video: false,
+    });
+    setMic('granted');
+
+    pc = new RTCPeerConnection(rtcCfg);
+    pc.addTransceiver('video', { direction: 'recvonly' });
+    pc.addTransceiver('audio', { direction: 'recvonly' });
+    for (const track of localStream.getAudioTracks()) {
+      pc.addTrack(track, localStream);
+    }
+    pc.onconnectionstatechange = () => {
+      if (pc) setState(pc.connectionState);
+    };
+    pc.ontrack = (ev) => {
+      if (ev.track.kind === 'video') {
+        document.getElementById('v').srcObject = ev.streams[0];
+      } else if (ev.track.kind === 'audio') {
+        document.getElementById('a').srcObject = ev.streams[0];
+      }
+    };
+
+    setState('connecting');
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    // Non-trickle flow: wait for ICE gathering so TURN/relay candidates are included.
+    await waitIceGatheringComplete(pc, 5000);
+    const resp = await fetch('/offer', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type }),
+    });
+    if (!resp.ok) {
+      throw new Error('offer failed: ' + await resp.text());
+    }
+    const answer = await resp.json();
+    sessionId = answer.session_id || null;
+    sessionToken = answer.session_token || null;
+    await pc.setRemoteDescription(answer);
+    setState('connected');
+  } catch (e) {
+    console.error(e);
+    setState('error');
+    setMic('error');
+    await cleanupPeer();
+    await cleanupSession();
+    stopBtn.disabled = true;
+  } finally {
+    startBtn.disabled = false;
+  }
+}
+
+async function stop() {
+  stopBtn.disabled = true;
+  setState('stopping');
+  await cleanupPeer();
+  await cleanupSession();
+  document.getElementById('v').srcObject = null;
+  document.getElementById('a').srcObject = null;
+  setMic('idle');
+  setState('idle');
+}
+
+startBtn.onclick = start;
+stopBtn.onclick = stop;
+
 setInterval(async () => {
   try {
     const s = await (await fetch('/status')).json();
     document.getElementById('dbg').textContent = JSON.stringify(s, null, 2);
   } catch (e) {}
 }, 1000);
+
+window.addEventListener('beforeunload', () => {
+  try {
+    if (localStream) {
+      for (const track of localStream.getTracks()) {
+        track.stop();
+      }
+    }
+    if (pc) {
+      pc.close();
+    }
+  } catch (e) {}
+});
 </script>
 </body>
 </html>
 """
+
+SESSION_TOKEN_HEADER = "x-session-token"
 
 
 @dataclass
@@ -162,6 +282,11 @@ class AppArgs:
     webrtc_audio_loopback: bool
     enable_api_auth: bool
     api_token: str
+    session_offer_timeout_seconds: float
+    session_max_age_seconds: float
+    session_cleanup_interval_seconds: float
+    single_session_mode: bool
+    web_test_only: bool
 
 
 @dataclass
@@ -169,12 +294,21 @@ class SessionState:
     session_id: str
     token: str
     created_epoch: float
+    last_activity_epoch: float
     pc: Optional["RTCPeerConnection"] = None
     pcid: Optional[str] = None
     inbound_task: Optional[asyncio.Task] = None
     mic_frames_rx: int = 0
     mic_samples_rx_16k: int = 0
     last_mic_rx_epoch: float = 0.0
+    last_offer_epoch: float = 0.0
+    personaplex_audio_frames_tx: int = 0
+    personaplex_audio_frames_rx: int = 0
+    personaplex_last_rx_epoch: float = 0.0
+    personaplex_connected: bool = False
+    personaplex_bridge: Optional["PersonaPlexChatBridge"] = None
+    personaplex_bridge_task: Optional[asyncio.Task] = None
+    close_reason: str = ""
 
 
 class PcmRingBuffer:
@@ -335,6 +469,114 @@ class PersonaPlexMirrorClient:
                     self._write_status()
                     print(f"[mirror] connection error: {e!r}")
                     await asyncio.sleep(max(0.2, self.reconnect_delay_seconds))
+
+
+class PersonaPlexChatBridge:
+    def __init__(
+        self,
+        ws_url: str,
+        session: SessionState,
+        pcm_ring_24k: PcmRingBuffer,
+        pcm_ring_16k: PcmRingBuffer,
+        audio_track_buffer: AudioTrackBuffer,
+        reconnect_delay_seconds: float,
+    ):
+        self.ws_url = ws_url
+        self.session = session
+        self.pcm_ring_24k = pcm_ring_24k
+        self.pcm_ring_16k = pcm_ring_16k
+        self.audio_track_buffer = audio_track_buffer
+        self.reconnect_delay_seconds = reconnect_delay_seconds
+        self.stop_event = asyncio.Event()
+        self.handshake = asyncio.Event()
+        self.uplink_queue = asyncio.Queue(maxsize=64)
+        self.reader = sphn.OpusStreamReader(24000)
+        self.writer = sphn.OpusStreamWriter(24000)
+        self.last_error = ""
+
+    async def push_uplink_pcm24k(self, pcm24k: np.ndarray) -> None:
+        if pcm24k.size == 0:
+            return
+        item = pcm24k.astype(np.float32, copy=False).copy()
+        if self.uplink_queue.full():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                _ = self.uplink_queue.get_nowait()
+        with contextlib.suppress(asyncio.QueueFull):
+            self.uplink_queue.put_nowait(item)
+            self.session.personaplex_audio_frames_tx += 1
+
+    async def _recv_loop(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        async for msg in ws:
+            if msg.type != aiohttp.WSMsgType.BINARY:
+                continue
+            data = msg.data
+            if not isinstance(data, (bytes, bytearray)) or len(data) < 2:
+                continue
+            kind = data[0]
+            payload = bytes(data[1:])
+            if kind == 0:
+                self.handshake.set()
+                self.session.personaplex_connected = True
+                continue
+            if kind != 1:
+                continue
+            self.reader.append_bytes(payload)
+            pcm24k = self.reader.read_pcm()
+            if pcm24k.shape[-1] == 0:
+                continue
+            pcm24k = np.asarray(pcm24k, dtype=np.float32).reshape(-1)
+            await self.pcm_ring_24k.append(pcm24k)
+            pcm16k = resample_poly(pcm24k, up=2, down=3).astype(np.float32, copy=False)
+            await self.pcm_ring_16k.append(pcm16k)
+            await self.audio_track_buffer.append_from_24k(pcm24k)
+            self.session.personaplex_audio_frames_rx += 1
+            self.session.personaplex_last_rx_epoch = time.time()
+
+    async def _send_loop(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(self.handshake.wait(), timeout=8.0)
+        while not self.stop_event.is_set() and not ws.closed:
+            try:
+                pcm24k = await asyncio.wait_for(self.uplink_queue.get(), timeout=0.25)
+            except asyncio.TimeoutError:
+                continue
+            if pcm24k.size == 0:
+                continue
+            self.writer.append_pcm(pcm24k)
+            pages = self.writer.read_bytes()
+            if pages:
+                await ws.send_bytes(b"\x01" + pages)
+
+    async def run(self) -> None:
+        async with aiohttp.ClientSession() as session:
+            while not self.stop_event.is_set():
+                self.handshake.clear()
+                try:
+                    async with session.ws_connect(self.ws_url, heartbeat=20.0) as ws:
+                        self.session.personaplex_connected = True
+                        recv_task = asyncio.create_task(self._recv_loop(ws))
+                        send_task = asyncio.create_task(self._send_loop(ws))
+                        done, pending = await asyncio.wait(
+                            [recv_task, send_task],
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        for task in pending:
+                            task.cancel()
+                        for task in pending:
+                            with contextlib.suppress(asyncio.CancelledError, Exception):
+                                await task
+                        for task in done:
+                            exc = task.exception()
+                            if exc is not None:
+                                raise exc
+                except Exception as e:
+                    self.last_error = repr(e)
+                    self.session.personaplex_connected = False
+                    if not self.stop_event.is_set():
+                        print(f"[personaplex-chat] bridge error: {e!r}")
+                if not self.stop_event.is_set():
+                    await asyncio.sleep(max(0.2, self.reconnect_delay_seconds))
+        self.session.personaplex_connected = False
 
 
 class MuseTalkRealtimeEngine:
@@ -617,9 +859,11 @@ class MuseTalkAudioTrack(AudioStreamTrack):
 class WebRtcApp:
     def __init__(self, args: AppArgs):
         self.args = args
+        self.started_epoch = time.time()
         self.pcs = set()
         self.pc_states = {}
         self.sessions: dict[str, SessionState] = {}
+        self.active_session_id: Optional[str] = None
         self.track_stats = {
             "video_frames_sent": 0,
             "audio_frames_sent": 0,
@@ -633,23 +877,153 @@ class WebRtcApp:
         self.audio_track_buffer = AudioTrackBuffer(max_samples_48k=int(args.ring_buffer_seconds * 48000))
         self.video_buffer = VideoFrameBuffer(maxsize=args.video_queue_size)
 
-        ws_url = self._build_mirror_ws_url()
-        self.mirror_client = PersonaPlexMirrorClient(
-            ws_url=ws_url,
-            pcm_ring_24k=self.pcm_ring_24k,
-            pcm_ring_16k=self.pcm_ring_16k,
-            audio_track_buffer=self.audio_track_buffer,
-            status_json=args.status_json,
-            reconnect_delay_seconds=args.reconnect_delay_seconds,
-        )
-        self.engine = MuseTalkRealtimeEngine(
-            args=args,
-            pcm_ring_16k=self.pcm_ring_16k,
-            video_buffer=self.video_buffer,
-        )
+        self.mirror_client: Optional[PersonaPlexMirrorClient] = None
+        self.engine: Optional[MuseTalkRealtimeEngine] = None
+        if not args.web_test_only:
+            if not self._personaplex_chat_enabled():
+                ws_url = self._build_mirror_ws_url()
+                self.mirror_client = PersonaPlexMirrorClient(
+                    ws_url=ws_url,
+                    pcm_ring_24k=self.pcm_ring_24k,
+                    pcm_ring_16k=self.pcm_ring_16k,
+                    audio_track_buffer=self.audio_track_buffer,
+                    status_json=args.status_json,
+                    reconnect_delay_seconds=args.reconnect_delay_seconds,
+                )
+            self.engine = MuseTalkRealtimeEngine(
+                args=args,
+                pcm_ring_16k=self.pcm_ring_16k,
+                video_buffer=self.video_buffer,
+            )
+        else:
+            self._seed_web_test_frame()
 
         self.mirror_task: Optional[asyncio.Task] = None
         self.engine_task: Optional[asyncio.Task] = None
+        self.session_cleanup_task: Optional[asyncio.Task] = None
+
+    def _personaplex_chat_enabled(self) -> bool:
+        if self.args.web_test_only:
+            return False
+        return self.args.personaplex_path.rstrip("/").endswith("/api/chat")
+
+    def _seed_web_test_frame(self) -> None:
+        h, w = 720, 1280
+        frame = np.zeros((h, w, 3), dtype=np.uint8)
+        frame[:, :, 0] = 34
+        frame[:, :, 1] = 22
+        frame[:, :, 2] = 18
+        cv2.rectangle(frame, (40, 40), (w - 40, h - 40), (90, 160, 230), 2)
+        cv2.putText(
+            frame,
+            "MuseTalk WebRTC Test Mode",
+            (90, 200),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.4,
+            (240, 240, 240),
+            3,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            frame,
+            "No model loading (connection test only)",
+            (90, 260),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.95,
+            (210, 210, 210),
+            2,
+            cv2.LINE_AA,
+        )
+        self.video_buffer.last_frame = frame
+
+    @staticmethod
+    def _coerce_bool(value: Any, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value).strip().lower()
+        if text in {"1", "true", "yes", "y", "on"}:
+            return True
+        if text in {"0", "false", "no", "n", "off"}:
+            return False
+        return default
+
+    async def _safe_json(self, request: web.Request) -> dict:
+        if not request.can_read_body:
+            return {}
+        with contextlib.suppress(Exception):
+            body = await request.json()
+            if isinstance(body, dict):
+                return body
+        return {}
+
+    def _touch_session(self, session: SessionState) -> None:
+        session.last_activity_epoch = time.time()
+
+    def _session_state(self, session: SessionState) -> str:
+        if session.pcid:
+            return self.pc_states.get(session.pcid, "new")
+        return "new"
+
+    def _session_should_expire(self, session: SessionState, now: float) -> tuple[bool, str]:
+        age = now - session.created_epoch
+        if age > max(1.0, self.args.session_max_age_seconds):
+            return True, "max_age_exceeded"
+
+        state = self._session_state(session)
+        if session.pc is None and age > max(1.0, self.args.session_offer_timeout_seconds):
+            return True, "offer_timeout"
+        if state in {"closed", "failed", "disconnected"}:
+            idle = now - session.last_activity_epoch
+            if idle > max(5.0, self.args.session_cleanup_interval_seconds * 2.0):
+                return True, f"pc_{state}"
+        return False, ""
+
+    async def _close_session(self, session: SessionState, reason: str) -> None:
+        sid = session.session_id
+        session.close_reason = reason
+        if session.personaplex_bridge is not None:
+            session.personaplex_bridge.stop_event.set()
+        if session.personaplex_bridge_task is not None:
+            session.personaplex_bridge_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await session.personaplex_bridge_task
+            session.personaplex_bridge_task = None
+        session.personaplex_bridge = None
+        session.personaplex_connected = False
+        if session.inbound_task is not None:
+            session.inbound_task.cancel()
+            session.inbound_task = None
+        if session.pc is not None:
+            with contextlib.suppress(Exception):
+                await session.pc.close()
+            self.pcs.discard(session.pc)
+            session.pc = None
+        if session.pcid:
+            self.pc_states[session.pcid] = "closed"
+        self.sessions.pop(sid, None)
+        if self.active_session_id == sid:
+            self.active_session_id = None
+
+    async def _expire_stale_sessions(self) -> None:
+        now = time.time()
+        expired: list[tuple[SessionState, str]] = []
+        for session in list(self.sessions.values()):
+            should_expire, reason = self._session_should_expire(session, now)
+            if should_expire:
+                expired.append((session, reason))
+        for session, reason in expired:
+            await self._close_session(session, reason)
+
+    async def _session_cleanup_loop(self) -> None:
+        interval = max(1.0, float(self.args.session_cleanup_interval_seconds))
+        while True:
+            await asyncio.sleep(interval)
+            with contextlib.suppress(Exception):
+                await self._expire_stale_sessions()
 
     def _aiortc_ice_servers(self):
         servers = []
@@ -695,26 +1069,31 @@ class WebRtcApp:
         return f"ws://{self.args.personaplex_host}:{self.args.personaplex_port}{path}?{qs}"
 
     async def on_startup(self, _app: web.Application):
-        if self.args.input_source in ("mirror", "mixed"):
+        if self.mirror_client is not None and self.args.input_source in ("mirror", "mixed"):
             self.mirror_task = asyncio.create_task(self.mirror_client.run())
-        self.engine_task = asyncio.create_task(self.engine.run())
+        if self.engine is not None:
+            self.engine_task = asyncio.create_task(self.engine.run())
+        self.session_cleanup_task = asyncio.create_task(self._session_cleanup_loop())
 
     async def on_cleanup(self, _app: web.Application):
-        self.mirror_client.stop_event.set()
-        self.engine.stop_event.set()
-        for task in (self.mirror_task, self.engine_task):
+        if self.mirror_client is not None:
+            self.mirror_client.stop_event.set()
+        if self.engine is not None:
+            self.engine.stop_event.set()
+        for task in (self.mirror_task, self.engine_task, self.session_cleanup_task):
             if task is not None:
                 task.cancel()
-        for task in (self.mirror_task, self.engine_task):
+        for task in (self.mirror_task, self.engine_task, self.session_cleanup_task):
             if task is not None:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
         for session in list(self.sessions.values()):
-            if session.inbound_task is not None:
-                session.inbound_task.cancel()
+            with contextlib.suppress(Exception):
+                await self._close_session(session, reason="shutdown")
         await asyncio.gather(*(pc.close() for pc in list(self.pcs)), return_exceptions=True)
         self.pcs.clear()
         self.sessions.clear()
+        self.active_session_id = None
 
     async def index(self, _request: web.Request) -> web.Response:
         return web.Response(text=HTML_PAGE, content_type="text/html")
@@ -723,18 +1102,49 @@ class WebRtcApp:
         return web.json_response(self._browser_rtc_config())
 
     async def status(self, _request: web.Request) -> web.Response:
-        payload = {
-            "mirror": {
+        await self._expire_stale_sessions()
+        if self.mirror_client is None:
+            mirror_payload = {
+                "enabled": False,
+                "connected": False,
+                "packets": 0,
+                "decoded_seconds": 0.0,
+                "last_rx_epoch": None,
+            }
+        else:
+            mirror_payload = {
+                "enabled": True,
                 "connected": self.mirror_client.connected,
                 "packets": self.mirror_client.packets,
                 "decoded_seconds": self.mirror_client.decoded_seconds,
                 "last_rx_epoch": self.mirror_client.last_rx_epoch or None,
+            }
+        if self.engine is None:
+            engine_payload = {
+                "mode": "web_test_only",
+                "jobs": 0,
+                "last_publish_epoch": None,
+                "last_error": None,
+            }
+        else:
+            engine_payload = self.engine.status()
+        payload = {
+            "uptime_seconds": round(time.time() - self.started_epoch, 1),
+            "mode": "web_test_only" if self.args.web_test_only else "musetalk",
+            "personaplex": {
+                "path": self.args.personaplex_path,
+                "duplex_chat_mode": self._personaplex_chat_enabled(),
+                "text_prompt_set": bool(self.args.personaplex_text_prompt),
+                "voice_prompt": self.args.personaplex_voice_prompt or None,
             },
-            "engine": self.engine.status(),
+            "mirror": mirror_payload,
+            "engine": engine_payload,
             "webrtc": {
                 "peer_count": len(self.pcs),
                 "peer_states": self.pc_states,
                 "session_count": len(self.sessions),
+                "active_session_id": self.active_session_id,
+                "single_session_mode": self.args.single_session_mode,
                 "track_stats": self.track_stats,
                 "ice": {
                     "servers": self.args.ice_servers,
@@ -751,80 +1161,212 @@ class WebRtcApp:
             return web.Response(status=503, text="snapshot unavailable")
         return web.Response(body=data, content_type="image/jpeg")
 
+    async def healthz(self, _request: web.Request) -> web.Response:
+        await self._expire_stale_sessions()
+        return web.json_response(
+            {
+                "ok": True,
+                "aiortc_available": AIORTC_AVAILABLE,
+                "uptime_seconds": round(time.time() - self.started_epoch, 1),
+                "active_session_id": self.active_session_id,
+                "session_count": len(self.sessions),
+            }
+        )
+
+    async def config_v1(self, _request: web.Request) -> web.Response:
+        return web.json_response(
+            {
+                "rtc_config": self._browser_rtc_config(),
+                "single_session_mode": self.args.single_session_mode,
+                "session_token_header": SESSION_TOKEN_HEADER,
+                "auth_enabled": self.args.enable_api_auth,
+            }
+        )
+
+    async def active_session(self, _request: web.Request) -> web.Response:
+        await self._expire_stale_sessions()
+        session = self._active_session()
+        if session is None:
+            return web.json_response({"active_session": None})
+        return web.json_response({"active_session": self._session_payload(session)})
+
+    def _active_session(self) -> Optional[SessionState]:
+        if self.active_session_id:
+            session = self.sessions.get(self.active_session_id)
+            if session is not None:
+                return session
+            self.active_session_id = None
+        for session in self.sessions.values():
+            state = self._session_state(session)
+            if state not in {"closed", "failed"}:
+                self.active_session_id = session.session_id
+                return session
+        return None
+
     def _create_session(self) -> SessionState:
+        now = time.time()
         session = SessionState(
             session_id=uuid.uuid4().hex,
             token=secrets.token_urlsafe(24),
-            created_epoch=time.time(),
+            created_epoch=now,
+            last_activity_epoch=now,
         )
         self.sessions[session.session_id] = session
+        self.active_session_id = session.session_id
         return session
 
     def _get_session(self, session_id: str) -> Optional[SessionState]:
         return self.sessions.get(session_id)
 
-    async def create_session(self, _request: web.Request) -> web.Response:
+    def _session_conflict_payload(self, session: SessionState) -> dict:
+        return {
+            "error": "single-session mode already has an active session",
+            "active_session": self._session_payload(session),
+            "hint": "Pass {\"replace\": true} to POST /v1/sessions to replace it.",
+        }
+
+    async def create_session(self, request: web.Request) -> web.Response:
+        await self._expire_stale_sessions()
+        body = await self._safe_json(request)
+        replace = self._coerce_bool(body.get("replace"), default=False) or self._coerce_bool(
+            request.query.get("replace"),
+            default=False,
+        )
+        if self.args.single_session_mode:
+            active = self._active_session()
+            if active is not None:
+                if not replace:
+                    return web.json_response(self._session_conflict_payload(active), status=409)
+                await self._close_session(active, reason="replaced")
+
         session = self._create_session()
         return web.json_response(
             {
                 "session_id": session.session_id,
                 "token": session.token,
                 "created_epoch": session.created_epoch,
+                "session_token_header": SESSION_TOKEN_HEADER,
+                "single_session_mode": self.args.single_session_mode,
             }
         )
 
+    def _check_session_token(self, request: web.Request, session: SessionState) -> Optional[web.Response]:
+        got = request.headers.get(SESSION_TOKEN_HEADER, "")
+        if not got:
+            return web.json_response({"error": f"missing {SESSION_TOKEN_HEADER} header"}, status=401)
+        if not secrets.compare_digest(got, session.token):
+            return web.json_response({"error": "invalid session token"}, status=401)
+        return None
+
     async def delete_session(self, request: web.Request) -> web.Response:
+        await self._expire_stale_sessions()
         sid = request.match_info["session_id"]
         session = self._get_session(sid)
         if session is None:
             return web.json_response({"error": "session not found"}, status=404)
-        if session.inbound_task is not None:
-            session.inbound_task.cancel()
-        if session.pc is not None:
-            with contextlib.suppress(Exception):
-                await session.pc.close()
-            self.pcs.discard(session.pc)
-        if session.pcid:
-            self.pc_states[session.pcid] = "closed"
-        del self.sessions[sid]
+        token_err = self._check_session_token(request, session)
+        if token_err is not None:
+            return token_err
+        await self._close_session(session, reason="client_delete")
         return web.json_response({"ok": True, "session_id": sid})
 
     async def session_stats(self, request: web.Request) -> web.Response:
+        await self._expire_stale_sessions()
         sid = request.match_info["session_id"]
         session = self._get_session(sid)
         if session is None:
             return web.json_response({"error": "session not found"}, status=404)
+        token_err = self._check_session_token(request, session)
+        if token_err is not None:
+            return token_err
+        self._touch_session(session)
         return web.json_response(self._session_payload(session))
 
     def _session_payload(self, session: SessionState) -> dict:
+        now = time.time()
         return {
             "session_id": session.session_id,
             "created_epoch": session.created_epoch,
+            "age_seconds": round(max(0.0, now - session.created_epoch), 3),
+            "last_activity_epoch": session.last_activity_epoch,
+            "last_offer_epoch": session.last_offer_epoch or None,
             "pc_state": self.pc_states.get(session.pcid or "", "new"),
             "mic_frames_rx": session.mic_frames_rx,
             "mic_samples_rx_16k": session.mic_samples_rx_16k,
             "last_mic_rx_epoch": session.last_mic_rx_epoch or None,
+            "personaplex_connected": session.personaplex_connected,
+            "personaplex_audio_frames_tx": session.personaplex_audio_frames_tx,
+            "personaplex_audio_frames_rx": session.personaplex_audio_frames_rx,
+            "personaplex_last_rx_epoch": session.personaplex_last_rx_epoch or None,
+            "active": session.session_id == self.active_session_id,
+            "close_reason": session.close_reason or None,
         }
 
+    async def _start_personaplex_chat_bridge(self, session: SessionState) -> None:
+        if not self._personaplex_chat_enabled():
+            return
+        if session.personaplex_bridge is not None:
+            session.personaplex_bridge.stop_event.set()
+        if session.personaplex_bridge_task is not None:
+            session.personaplex_bridge_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await session.personaplex_bridge_task
+            session.personaplex_bridge_task = None
+
+        ws_url = self._build_mirror_ws_url()
+        bridge = PersonaPlexChatBridge(
+            ws_url=ws_url,
+            session=session,
+            pcm_ring_24k=self.pcm_ring_24k,
+            pcm_ring_16k=self.pcm_ring_16k,
+            audio_track_buffer=self.audio_track_buffer,
+            reconnect_delay_seconds=self.args.reconnect_delay_seconds,
+        )
+        session.personaplex_bridge = bridge
+        session.personaplex_bridge_task = asyncio.create_task(bridge.run())
+        print(f"[personaplex-chat] started for session={session.session_id} url={ws_url}")
+
     async def offer(self, request: web.Request) -> web.Response:
+        await self._expire_stale_sessions()
+        if self.args.single_session_mode:
+            active = self._active_session()
+            if active is not None:
+                await self._close_session(active, reason="legacy_offer_replaced")
         session = self._create_session()
-        return await self._handle_offer(request, session=session)
+        return await self._handle_offer(request, session=session, include_session_token=True)
 
     async def session_offer(self, request: web.Request) -> web.Response:
+        await self._expire_stale_sessions()
         sid = request.match_info["session_id"]
         session = self._get_session(sid)
         if session is None:
             return web.json_response({"error": "session not found"}, status=404)
+        token_err = self._check_session_token(request, session)
+        if token_err is not None:
+            return token_err
+        if self.args.single_session_mode and self.active_session_id and self.active_session_id != sid:
+            active = self._active_session()
+            if active is not None:
+                return web.json_response(self._session_conflict_payload(active), status=409)
         return await self._handle_offer(request, session=session)
 
-    async def _handle_offer(self, request: web.Request, session: SessionState) -> web.Response:
+    async def _handle_offer(
+        self,
+        request: web.Request,
+        session: SessionState,
+        include_session_token: bool = False,
+    ) -> web.Response:
         if not AIORTC_AVAILABLE:
             return web.json_response(
                 {"error": "aiortc/av not installed. Install: pip install aiortc av"},
                 status=500,
             )
-        params = await request.json()
-        offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
+        params = await self._safe_json(request)
+        sdp = params.get("sdp")
+        offer_type = str(params.get("type", "")).lower()
+        if not isinstance(sdp, str) or not sdp.strip() or offer_type != "offer":
+            return web.json_response({"error": "invalid offer payload; expected {type:'offer', sdp:'...'}"}, status=400)
+        offer = RTCSessionDescription(sdp=sdp, type=offer_type)
         if session.pc is not None:
             with contextlib.suppress(Exception):
                 await session.pc.close()
@@ -836,16 +1378,22 @@ class WebRtcApp:
         self.pc_states[pcid] = pc.connectionState
         session.pc = pc
         session.pcid = pcid
+        session.last_offer_epoch = time.time()
+        self._touch_session(session)
+        self.active_session_id = session.session_id
+        await self._start_personaplex_chat_bridge(session)
 
         @pc.on("connectionstatechange")
         async def on_connectionstatechange():
             self.pc_states[pcid] = pc.connectionState
-            if pc.connectionState in ("failed", "closed", "disconnected"):
+            self._touch_session(session)
+            if pc.connectionState in ("failed", "closed"):
                 await pc.close()
                 self.pcs.discard(pc)
                 self.pc_states[pcid] = "closed"
                 if session.inbound_task is not None:
                     session.inbound_task.cancel()
+                    session.inbound_task = None
 
         @pc.on("track")
         async def on_track(track):
@@ -854,6 +1402,7 @@ class WebRtcApp:
             if session.inbound_task is not None:
                 session.inbound_task.cancel()
             session.inbound_task = asyncio.create_task(self._consume_inbound_audio(track, session))
+            self._touch_session(session)
 
         video_track = MuseTalkVideoTrack(self.video_buffer, fps=self.args.fps, stats=self.track_stats)
         audio_track = MuseTalkAudioTrack(self.audio_track_buffer, stats=self.track_stats)
@@ -865,13 +1414,15 @@ class WebRtcApp:
         await pc.setLocalDescription(answer)
         await self._wait_for_ice_gathering(pc, timeout=3.0)
 
-        return web.json_response(
-            {
-                "session_id": session.session_id,
-                "sdp": pc.localDescription.sdp,
-                "type": pc.localDescription.type,
-            }
-        )
+        payload = {
+            "session_id": session.session_id,
+            "sdp": pc.localDescription.sdp,
+            "type": pc.localDescription.type,
+        }
+        if include_session_token:
+            payload["session_token"] = session.token
+            payload["session_token_header"] = SESSION_TOKEN_HEADER
+        return web.json_response(payload)
 
     async def _consume_inbound_audio(self, track, session: SessionState) -> None:
         while True:
@@ -892,11 +1443,16 @@ class WebRtcApp:
             session.mic_samples_rx_16k += int(pcm16k.size)
             session.mic_frames_rx += 1
             session.last_mic_rx_epoch = time.time()
+            self._touch_session(session)
 
-            if self.args.input_source in ("webrtc", "mixed"):
+            if session.personaplex_bridge is not None:
+                pcm24k_uplink = self._resample_audio(pcm, src_sr, 24000)
+                await session.personaplex_bridge.push_uplink_pcm24k(pcm24k_uplink)
+
+            if self.args.input_source in ("webrtc", "mixed") and session.personaplex_bridge is None:
                 await self.pcm_ring_16k.append(pcm16k)
 
-            if self.args.webrtc_audio_loopback:
+            if self.args.webrtc_audio_loopback and session.personaplex_bridge is None:
                 pcm24k = self._resample_audio(pcm, src_sr, 24000)
                 await self.pcm_ring_24k.append(pcm24k)
                 await self.audio_track_buffer.append_from_24k(pcm24k)
@@ -938,10 +1494,13 @@ class WebRtcApp:
         app.on_startup.append(self.on_startup)
         app.on_cleanup.append(self.on_cleanup)
         app.router.add_get("/", self.index)
+        app.router.add_get("/healthz", self.healthz)
         app.router.add_get("/config", self.config)
         app.router.add_get("/status", self.status)
         app.router.add_get("/snapshot.jpg", self.snapshot)
         app.router.add_post("/offer", self.offer)
+        app.router.add_get("/v1/config", self.config_v1)
+        app.router.add_get("/v1/session", self.active_session)
         app.router.add_post("/v1/sessions", self.create_session)
         app.router.add_post("/v1/sessions/{session_id}/offer", self.session_offer)
         app.router.add_get("/v1/sessions/{session_id}/stats", self.session_stats)
@@ -1036,6 +1595,34 @@ def parse_args() -> AppArgs:
         help="Bearer token used when --enable-api-auth is set.",
     )
     parser.add_argument(
+        "--session-offer-timeout-seconds",
+        type=float,
+        default=90.0,
+        help="Expire sessions that never receive SDP offer after this timeout.",
+    )
+    parser.add_argument(
+        "--session-max-age-seconds",
+        type=float,
+        default=7200.0,
+        help="Force-expire sessions older than this max age.",
+    )
+    parser.add_argument(
+        "--session-cleanup-interval-seconds",
+        type=float,
+        default=5.0,
+        help="Background interval for expiring stale sessions.",
+    )
+    parser.add_argument(
+        "--multi-session",
+        action="store_true",
+        help="Allow multiple concurrent sessions (disabled by default).",
+    )
+    parser.add_argument(
+        "--web-test-only",
+        action="store_true",
+        help="Run signaling/web app only (no MuseTalk model load). Useful for WebRTC connection testing.",
+    )
+    parser.add_argument(
         "--status-json",
         type=str,
         default="data/live/in_memory_pipeline_status.json",
@@ -1090,6 +1677,11 @@ def parse_args() -> AppArgs:
         webrtc_audio_loopback=ns.webrtc_audio_loopback,
         enable_api_auth=ns.enable_api_auth,
         api_token=ns.api_token,
+        session_offer_timeout_seconds=ns.session_offer_timeout_seconds,
+        session_max_age_seconds=ns.session_max_age_seconds,
+        session_cleanup_interval_seconds=ns.session_cleanup_interval_seconds,
+        single_session_mode=(not ns.multi_session),
+        web_test_only=ns.web_test_only,
     )
 
 
@@ -1097,14 +1689,24 @@ def main():
     args = parse_args()
     if not AIORTC_AVAILABLE:
         raise SystemExit("aiortc/av is required for WebRTC output. Install with: pip install aiortc av")
+    chat_mode = (not args.web_test_only) and args.personaplex_path.rstrip("/").endswith("/api/chat")
+    if chat_mode and not str(args.personaplex_voice_prompt).strip():
+        print(
+            "[webrtc][warn] personaplex_path=/api/chat but --personaplex-voice-prompt is empty. "
+            "If Personaplex enforces voice_prompt_dir, set a valid filename (e.g. s0.wav)."
+        )
     app_state = WebRtcApp(args)
     app = app_state.build_app()
     print(f"[webrtc] serving http://{args.host}:{args.port}/")
     print(
-        "[webrtc] endpoints: /offer (legacy), /v1/sessions (create), "
-        "/v1/sessions/{id}/offer (MVP duplex), /status (diagnostics)"
+        "[webrtc] endpoints: /healthz, /offer (legacy), /v1/config, /v1/session, "
+        "/v1/sessions (create), /v1/sessions/{id}/offer, /v1/sessions/{id}/stats, /status"
     )
     print(f"[webrtc] input_source={args.input_source} webrtc_audio_loopback={args.webrtc_audio_loopback}")
+    print(f"[webrtc] single_session_mode={args.single_session_mode} session_token_header={SESSION_TOKEN_HEADER}")
+    print(f"[webrtc] personaplex_path={args.personaplex_path} chat_mode={chat_mode}")
+    if args.web_test_only:
+        print("[webrtc] web-test-only enabled (MuseTalk model initialization skipped)")
     if args.enable_api_auth:
         print("[webrtc] /v1 auth middleware enabled")
     web.run_app(app, host=args.host, port=args.port)
