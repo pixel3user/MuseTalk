@@ -139,6 +139,17 @@ def parse_args() -> AppArgs:
         default="data/live/in_memory_pipeline_status.json",
         help="Optional status file path. Empty string disables.",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable verbose runtime debug logs and include debug events in /status.",
+    )
+    parser.add_argument(
+        "--debug-events-limit",
+        type=int,
+        default=250,
+        help="Maximum in-memory debug events retained for /status.",
+    )
 
     ns = parser.parse_args()
     status_json = Path(ns.status_json).expanduser().resolve() if str(ns.status_json).strip() else None
@@ -193,6 +204,8 @@ def parse_args() -> AppArgs:
         session_cleanup_interval_seconds=ns.session_cleanup_interval_seconds,
         single_session_mode=(not ns.multi_session),
         web_test_only=ns.web_test_only,
+        debug=ns.debug,
+        debug_events_limit=ns.debug_events_limit,
     )
 
 
@@ -222,6 +235,7 @@ def main():
         print("[webrtc] web-test-only enabled (MuseTalk model initialization skipped)")
     if args.enable_api_auth:
         print("[webrtc] /v1 auth middleware enabled")
+    if args.debug:
+        print(f"[webrtc] debug mode enabled (events_limit={args.debug_events_limit})")
     web.run_app(app, host=args.host, port=args.port)
-
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import secrets
 import time
 import uuid
@@ -55,6 +56,8 @@ class WebRtcApp:
             "last_video_send_epoch": 0.0,
             "last_audio_send_epoch": 0.0,
         }
+        self.debug_events: list[dict[str, Any]] = []
+        self.debug_events_limit = max(25, int(args.debug_events_limit))
 
         ring_samples = int(args.ring_buffer_seconds * 24000)
         self.pcm_ring_24k = PcmRingBuffer(max_samples=ring_samples)
@@ -93,6 +96,22 @@ class WebRtcApp:
         if self.args.web_test_only:
             return False
         return self.args.personaplex_path.rstrip("/").endswith("/api/chat")
+
+    def _debug(self, event: str, **fields: Any) -> None:
+        """Record and optionally print runtime debug events."""
+
+        payload: dict[str, Any] = {
+            "ts_epoch": round(time.time(), 3),
+            "event": event,
+        }
+        if fields:
+            payload.update(fields)
+        self.debug_events.append(payload)
+        if len(self.debug_events) > self.debug_events_limit:
+            self.debug_events = self.debug_events[-self.debug_events_limit :]
+        if self.args.debug:
+            with contextlib.suppress(Exception):
+                print(f"[debug] {json.dumps(payload, ensure_ascii=True, default=str)}")
 
     def _seed_web_test_frame(self) -> None:
         """Seed placeholder frame used when `--web-test-only` is enabled."""
@@ -186,6 +205,7 @@ class WebRtcApp:
 
         sid = session.session_id
         session.close_reason = reason
+        self._debug("session.close", session_id=sid, reason=reason, pc_state=self._session_state(session))
         if session.personaplex_bridge is not None:
             session.personaplex_bridge.stop_event.set()
         if session.personaplex_bridge_task is not None:
@@ -282,6 +302,13 @@ class WebRtcApp:
     async def on_startup(self, _app: web.Application):
         """Aiohttp startup hook: start mirror/engine/cleanup tasks."""
 
+        self._debug(
+            "app.startup",
+            port=self.args.port,
+            input_source=self.args.input_source,
+            personaplex_path=self.args.personaplex_path,
+            chat_mode=self._personaplex_chat_enabled(),
+        )
         if self.mirror_client is not None and self.args.input_source in ("mirror", "mixed"):
             self.mirror_task = asyncio.create_task(self.mirror_client.run())
         if self.engine is not None:
@@ -291,6 +318,7 @@ class WebRtcApp:
     async def on_cleanup(self, _app: web.Application):
         """Aiohttp cleanup hook: stop tasks, close sessions, close peers."""
 
+        self._debug("app.cleanup")
         if self.mirror_client is not None:
             self.mirror_client.stop_event.set()
         if self.engine is not None:
@@ -374,6 +402,11 @@ class WebRtcApp:
                 "auth_enabled": self.args.enable_api_auth,
             },
         }
+        payload["debug"] = {
+            "enabled": bool(self.args.debug),
+            "events_limit": self.debug_events_limit,
+            "events": self.debug_events[-50:],
+        }
         return web.json_response(payload)
 
     async def snapshot(self, _request: web.Request) -> web.Response:
@@ -446,6 +479,7 @@ class WebRtcApp:
         )
         self.sessions[session.session_id] = session
         self.active_session_id = session.session_id
+        self._debug("session.created", session_id=session.session_id)
         return session
 
     def _get_session(self, session_id: str) -> Optional[SessionState]:
@@ -531,6 +565,18 @@ class WebRtcApp:
         """Normalize session state into API response shape."""
 
         now = time.time()
+        bridge = session.personaplex_bridge
+        bridge_last_error = None
+        bridge_uplink_q = 0
+        bridge_handshake_epoch = None
+        bridge_rx_packets = 0
+        bridge_tx_packets = 0
+        if bridge is not None:
+            bridge_last_error = bridge.last_error or None
+            bridge_uplink_q = int(bridge.uplink_queue.qsize())
+            bridge_handshake_epoch = bridge.handshake_epoch or None
+            bridge_rx_packets = int(bridge.rx_packets)
+            bridge_tx_packets = int(bridge.tx_packets)
         return {
             "session_id": session.session_id,
             "created_epoch": session.created_epoch,
@@ -545,6 +591,11 @@ class WebRtcApp:
             "personaplex_audio_frames_tx": session.personaplex_audio_frames_tx,
             "personaplex_audio_frames_rx": session.personaplex_audio_frames_rx,
             "personaplex_last_rx_epoch": session.personaplex_last_rx_epoch or None,
+            "personaplex_bridge_last_error": bridge_last_error,
+            "personaplex_uplink_queue_size": bridge_uplink_q,
+            "personaplex_handshake_epoch": bridge_handshake_epoch,
+            "personaplex_rx_packets": bridge_rx_packets,
+            "personaplex_tx_packets": bridge_tx_packets,
             "active": session.session_id == self.active_session_id,
             "close_reason": session.close_reason or None,
         }
@@ -554,6 +605,7 @@ class WebRtcApp:
 
         if not self._personaplex_chat_enabled():
             return
+        self._debug("personaplex_chat.starting", session_id=session.session_id)
         if session.personaplex_bridge is not None:
             session.personaplex_bridge.stop_event.set()
         if session.personaplex_bridge_task is not None:
@@ -570,15 +622,18 @@ class WebRtcApp:
             pcm_ring_16k=self.pcm_ring_16k,
             audio_track_buffer=self.audio_track_buffer,
             reconnect_delay_seconds=self.args.reconnect_delay_seconds,
+            debug_log=self._debug,
         )
         session.personaplex_bridge = bridge
         session.personaplex_bridge_task = asyncio.create_task(bridge.run())
+        self._debug("personaplex_chat.started", session_id=session.session_id, ws_url=ws_url)
         print(f"[personaplex-chat] started for session={session.session_id} url={ws_url}")
 
     async def offer(self, request: web.Request) -> web.Response:
         """Legacy offer endpoint that auto-creates session and returns answer."""
 
         await self._expire_stale_sessions()
+        self._debug("offer.legacy.request", remote=request.remote or "")
         if self.args.single_session_mode:
             active = self._active_session()
             if active is not None:
@@ -591,6 +646,7 @@ class WebRtcApp:
 
         await self._expire_stale_sessions()
         sid = request.match_info["session_id"]
+        self._debug("offer.session.request", remote=request.remote or "", session_id=sid)
         session = self._get_session(sid)
         if session is None:
             return web.json_response({"error": "session not found"}, status=404)
@@ -619,7 +675,15 @@ class WebRtcApp:
         params = await self._safe_json(request)
         sdp = params.get("sdp")
         offer_type = str(params.get("type", "")).lower()
+        self._debug(
+            "offer.received",
+            session_id=session.session_id,
+            remote=request.remote or "",
+            offer_type=offer_type,
+            sdp_len=(len(sdp) if isinstance(sdp, str) else -1),
+        )
         if not isinstance(sdp, str) or not sdp.strip() or offer_type != "offer":
+            self._debug("offer.invalid_payload", session_id=session.session_id)
             return web.json_response({"error": "invalid offer payload; expected {type:'offer', sdp:'...'}"}, status=400)
         offer = RTCSessionDescription(sdp=sdp, type=offer_type)
         if session.pc is not None:
@@ -636,6 +700,7 @@ class WebRtcApp:
         session.last_offer_epoch = time.time()
         self._touch_session(session)
         self.active_session_id = session.session_id
+        self._debug("offer.pc_created", session_id=session.session_id, pcid=pcid)
         await self._start_personaplex_chat_bridge(session)
 
         @pc.on("connectionstatechange")
@@ -644,6 +709,12 @@ class WebRtcApp:
 
             self.pc_states[pcid] = pc.connectionState
             self._touch_session(session)
+            self._debug(
+                "webrtc.connection_state",
+                session_id=session.session_id,
+                pcid=pcid,
+                state=pc.connectionState,
+            )
             if pc.connectionState in ("failed", "closed"):
                 await pc.close()
                 self.pcs.discard(pc)
@@ -656,6 +727,11 @@ class WebRtcApp:
         async def on_track(track):
             """Attach inbound browser mic audio consumer when audio track arrives."""
 
+            self._debug(
+                "webrtc.track",
+                session_id=session.session_id,
+                kind=getattr(track, "kind", "unknown"),
+            )
             if getattr(track, "kind", "") != "audio":
                 return
             if session.inbound_task is not None:
@@ -672,6 +748,7 @@ class WebRtcApp:
         answer = await pc.createAnswer()
         await pc.setLocalDescription(answer)
         await self._wait_for_ice_gathering(pc, timeout=3.0)
+        self._debug("offer.answer_ready", session_id=session.session_id, pcid=pcid)
 
         payload = {
             "session_id": session.session_id,
@@ -694,37 +771,54 @@ class WebRtcApp:
         - `None` (infinite loop until track closes/cancelled).
         """
 
-        while True:
-            frame = await track.recv()
-            pcm = frame.to_ndarray()
-            pcm = np.asarray(pcm)
-            if pcm.ndim == 2:
-                pcm = pcm.mean(axis=0)
-            pcm = pcm.reshape(-1).astype(np.float32, copy=False)
-            fmt_name = str(getattr(getattr(frame, "format", None), "name", "")).lower()
-            if fmt_name.startswith(("s16", "s32", "u8")):
-                pcm = pcm / 32768.0
-            src_sr = int(getattr(frame, "sample_rate", 48000) or 48000)
-            if pcm.size == 0:
-                continue
+        frame_counter = 0
+        try:
+            while True:
+                frame = await track.recv()
+                pcm = frame.to_ndarray()
+                pcm = np.asarray(pcm)
+                if pcm.ndim == 2:
+                    pcm = pcm.mean(axis=0)
+                pcm = pcm.reshape(-1).astype(np.float32, copy=False)
+                fmt_name = str(getattr(getattr(frame, "format", None), "name", "")).lower()
+                if fmt_name.startswith(("s16", "s32", "u8")):
+                    pcm = pcm / 32768.0
+                src_sr = int(getattr(frame, "sample_rate", 48000) or 48000)
+                if pcm.size == 0:
+                    continue
 
-            pcm16k = self._resample_audio(pcm, src_sr, 16000)
-            session.mic_samples_rx_16k += int(pcm16k.size)
-            session.mic_frames_rx += 1
-            session.last_mic_rx_epoch = time.time()
-            self._touch_session(session)
+                pcm16k = self._resample_audio(pcm, src_sr, 16000)
+                session.mic_samples_rx_16k += int(pcm16k.size)
+                session.mic_frames_rx += 1
+                session.last_mic_rx_epoch = time.time()
+                self._touch_session(session)
+                frame_counter += 1
+                if frame_counter in {1, 50}:
+                    self._debug(
+                        "mic.rx",
+                        session_id=session.session_id,
+                        frames=int(session.mic_frames_rx),
+                        src_sr=src_sr,
+                        samples=int(pcm.size),
+                    )
 
-            if session.personaplex_bridge is not None:
-                pcm24k_uplink = self._resample_audio(pcm, src_sr, 24000)
-                await session.personaplex_bridge.push_uplink_pcm24k(pcm24k_uplink)
+                if session.personaplex_bridge is not None:
+                    pcm24k_uplink = self._resample_audio(pcm, src_sr, 24000)
+                    await session.personaplex_bridge.push_uplink_pcm24k(pcm24k_uplink)
 
-            if self.args.input_source in ("webrtc", "mixed") and session.personaplex_bridge is None:
-                await self.pcm_ring_16k.append(pcm16k)
+                if self.args.input_source in ("webrtc", "mixed") and session.personaplex_bridge is None:
+                    await self.pcm_ring_16k.append(pcm16k)
 
-            if self.args.webrtc_audio_loopback and session.personaplex_bridge is None:
-                pcm24k = self._resample_audio(pcm, src_sr, 24000)
-                await self.pcm_ring_24k.append(pcm24k)
-                await self.audio_track_buffer.append_from_24k(pcm24k)
+                if self.args.webrtc_audio_loopback and session.personaplex_bridge is None:
+                    pcm24k = self._resample_audio(pcm, src_sr, 24000)
+                    await self.pcm_ring_24k.append(pcm24k)
+                    await self.audio_track_buffer.append_from_24k(pcm24k)
+        except asyncio.CancelledError:
+            self._debug("mic.loop_cancelled", session_id=session.session_id)
+            raise
+        except Exception as e:
+            self._debug("mic.loop_error", session_id=session.session_id, error=repr(e))
+            raise
 
     def _resample_audio(self, pcm: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
         """Resample mono PCM to target sample rate using polyphase filter."""
@@ -765,6 +859,8 @@ class WebRtcApp:
 
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(done.wait(), timeout=timeout)
+        if pc.iceGatheringState != "complete":
+            self._debug("webrtc.ice_gather_timeout", timeout=timeout, state=pc.iceGatheringState)
 
     def build_app(self) -> web.Application:
         """Create aiohttp app and register all public routes."""

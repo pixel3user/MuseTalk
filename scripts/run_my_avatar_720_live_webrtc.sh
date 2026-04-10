@@ -52,6 +52,12 @@ fi
 if [[ "${WEB_TEST_ONLY:-0}" == "1" ]]; then
   EXTRA_ARGS+=(--web-test-only)
 fi
+if [[ "${DEBUG_WEBRTC:-0}" == "1" ]]; then
+  EXTRA_ARGS+=(--debug)
+fi
+if [[ -n "${DEBUG_EVENTS_LIMIT:-}" ]]; then
+  EXTRA_ARGS+=(--debug-events-limit "${DEBUG_EVENTS_LIMIT}")
+fi
 
 python -m scripts.personaplex_musetalk_webrtc \
   --host "${HOST:-0.0.0.0}" \

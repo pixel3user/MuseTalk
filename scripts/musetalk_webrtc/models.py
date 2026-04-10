@@ -71,6 +71,8 @@ class AppArgs:
     session_cleanup_interval_seconds: float
     single_session_mode: bool
     web_test_only: bool
+    debug: bool
+    debug_events_limit: int
 
 
 @dataclass
@@ -105,4 +107,3 @@ class SessionState:
     personaplex_bridge: Optional["PersonaPlexChatBridge"] = None
     personaplex_bridge_task: Optional[asyncio.Task] = None
     close_reason: str = ""
-

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-TURN_ENV="/teamspace/studios/this_studio/turn-native/turn_credentials.env"
+TURN_ENV="/opt/onebox/turn-native/turn_credentials.env"
 if [[ ! -f "$TURN_ENV" ]]; then
   echo "TURN credentials file not found: $TURN_ENV" >&2
   exit 1

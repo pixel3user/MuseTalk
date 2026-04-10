@@ -7,7 +7,7 @@ import contextlib
 import json
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, Optional
 
 import aiohttp
 import numpy as np
@@ -140,6 +140,7 @@ class PersonaPlexChatBridge:
         pcm_ring_16k: PcmRingBuffer,
         audio_track_buffer: AudioTrackBuffer,
         reconnect_delay_seconds: float,
+        debug_log: Optional[Callable[..., Any]] = None,
     ):
         """Create duplex websocket bridge for a single session (`/api/chat`).
 
@@ -165,6 +166,10 @@ class PersonaPlexChatBridge:
         self.reader = sphn.OpusStreamReader(24000)
         self.writer = sphn.OpusStreamWriter(24000)
         self.last_error = ""
+        self.handshake_epoch = 0.0
+        self.rx_packets = 0
+        self.tx_packets = 0
+        self.debug_log = debug_log
 
     async def push_uplink_pcm24k(self, pcm24k: np.ndarray) -> None:
         """Queue browser mic PCM (24k) for upstream websocket send.
@@ -182,6 +187,12 @@ class PersonaPlexChatBridge:
         if self.uplink_queue.full():
             with contextlib.suppress(asyncio.QueueEmpty):
                 _ = self.uplink_queue.get_nowait()
+            if self.debug_log is not None:
+                self.debug_log(
+                    "personaplex_chat.uplink_drop",
+                    session_id=self.session.session_id,
+                    queue_size=int(self.uplink_queue.qsize()),
+                )
         with contextlib.suppress(asyncio.QueueFull):
             self.uplink_queue.put_nowait(item)
             self.session.personaplex_audio_frames_tx += 1
@@ -206,10 +217,18 @@ class PersonaPlexChatBridge:
             payload = bytes(data[1:])
             if kind == 0:
                 self.handshake.set()
+                self.handshake_epoch = time.time()
                 self.session.personaplex_connected = True
+                if self.debug_log is not None:
+                    self.debug_log(
+                        "personaplex_chat.handshake",
+                        session_id=self.session.session_id,
+                        ws_url=self.ws_url,
+                    )
                 continue
             if kind != 1:
                 continue
+            self.rx_packets += 1
             self.reader.append_bytes(payload)
             pcm24k = self.reader.read_pcm()
             if pcm24k.shape[-1] == 0:
@@ -221,6 +240,13 @@ class PersonaPlexChatBridge:
             await self.audio_track_buffer.append_from_24k(pcm24k)
             self.session.personaplex_audio_frames_rx += 1
             self.session.personaplex_last_rx_epoch = time.time()
+            if self.debug_log is not None and self.rx_packets in {1, 10}:
+                self.debug_log(
+                    "personaplex_chat.rx_audio",
+                    session_id=self.session.session_id,
+                    packets=self.rx_packets,
+                    pcm_samples=int(pcm24k.size),
+                )
 
     async def _send_loop(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         """Encode queued uplink PCM to Opus and send binary chat frames.
@@ -245,6 +271,14 @@ class PersonaPlexChatBridge:
             pages = self.writer.read_bytes()
             if pages:
                 await ws.send_bytes(b"\x01" + pages)
+                self.tx_packets += 1
+                if self.debug_log is not None and self.tx_packets in {1, 10}:
+                    self.debug_log(
+                        "personaplex_chat.tx_audio",
+                        session_id=self.session.session_id,
+                        packets=self.tx_packets,
+                        bytes=int(len(pages)),
+                    )
 
     async def run(self) -> None:
         """Run reconnecting duplex bridge using concurrent recv/send tasks.
@@ -262,6 +296,12 @@ class PersonaPlexChatBridge:
                 try:
                     async with session.ws_connect(self.ws_url, heartbeat=20.0) as ws:
                         self.session.personaplex_connected = True
+                        if self.debug_log is not None:
+                            self.debug_log(
+                                "personaplex_chat.ws_connected",
+                                session_id=self.session.session_id,
+                                ws_url=self.ws_url,
+                            )
                         recv_task = asyncio.create_task(self._recv_loop(ws))
                         send_task = asyncio.create_task(self._send_loop(ws))
                         done, pending = await asyncio.wait(
@@ -280,9 +320,14 @@ class PersonaPlexChatBridge:
                 except Exception as e:
                     self.last_error = repr(e)
                     self.session.personaplex_connected = False
+                    if self.debug_log is not None:
+                        self.debug_log(
+                            "personaplex_chat.error",
+                            session_id=self.session.session_id,
+                            error=self.last_error,
+                        )
                     if not self.stop_event.is_set():
                         print(f"[personaplex-chat] bridge error: {e!r}")
                 if not self.stop_event.is_set():
                     await asyncio.sleep(max(0.2, self.reconnect_delay_seconds))
         self.session.personaplex_connected = False
-
