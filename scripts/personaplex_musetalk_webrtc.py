@@ -3,7 +3,9 @@ import asyncio
 import contextlib
 import fractions
 import json
+import secrets
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -156,6 +158,23 @@ class AppArgs:
     video_queue_size: int
     status_json: Optional[Path]
     reconnect_delay_seconds: float
+    input_source: str
+    webrtc_audio_loopback: bool
+    enable_api_auth: bool
+    api_token: str
+
+
+@dataclass
+class SessionState:
+    session_id: str
+    token: str
+    created_epoch: float
+    pc: Optional["RTCPeerConnection"] = None
+    pcid: Optional[str] = None
+    inbound_task: Optional[asyncio.Task] = None
+    mic_frames_rx: int = 0
+    mic_samples_rx_16k: int = 0
+    last_mic_rx_epoch: float = 0.0
 
 
 class PcmRingBuffer:
@@ -600,6 +619,7 @@ class WebRtcApp:
         self.args = args
         self.pcs = set()
         self.pc_states = {}
+        self.sessions: dict[str, SessionState] = {}
         self.track_stats = {
             "video_frames_sent": 0,
             "audio_frames_sent": 0,
@@ -675,7 +695,8 @@ class WebRtcApp:
         return f"ws://{self.args.personaplex_host}:{self.args.personaplex_port}{path}?{qs}"
 
     async def on_startup(self, _app: web.Application):
-        self.mirror_task = asyncio.create_task(self.mirror_client.run())
+        if self.args.input_source in ("mirror", "mixed"):
+            self.mirror_task = asyncio.create_task(self.mirror_client.run())
         self.engine_task = asyncio.create_task(self.engine.run())
 
     async def on_cleanup(self, _app: web.Application):
@@ -688,8 +709,12 @@ class WebRtcApp:
             if task is not None:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
+        for session in list(self.sessions.values()):
+            if session.inbound_task is not None:
+                session.inbound_task.cancel()
         await asyncio.gather(*(pc.close() for pc in list(self.pcs)), return_exceptions=True)
         self.pcs.clear()
+        self.sessions.clear()
 
     async def index(self, _request: web.Request) -> web.Response:
         return web.Response(text=HTML_PAGE, content_type="text/html")
@@ -709,11 +734,13 @@ class WebRtcApp:
             "webrtc": {
                 "peer_count": len(self.pcs),
                 "peer_states": self.pc_states,
+                "session_count": len(self.sessions),
                 "track_stats": self.track_stats,
                 "ice": {
                     "servers": self.args.ice_servers,
                     "transport_policy": self.args.ice_transport_policy,
                 },
+                "auth_enabled": self.args.enable_api_auth,
             },
         }
         return web.json_response(payload)
@@ -724,7 +751,73 @@ class WebRtcApp:
             return web.Response(status=503, text="snapshot unavailable")
         return web.Response(body=data, content_type="image/jpeg")
 
+    def _create_session(self) -> SessionState:
+        session = SessionState(
+            session_id=uuid.uuid4().hex,
+            token=secrets.token_urlsafe(24),
+            created_epoch=time.time(),
+        )
+        self.sessions[session.session_id] = session
+        return session
+
+    def _get_session(self, session_id: str) -> Optional[SessionState]:
+        return self.sessions.get(session_id)
+
+    async def create_session(self, _request: web.Request) -> web.Response:
+        session = self._create_session()
+        return web.json_response(
+            {
+                "session_id": session.session_id,
+                "token": session.token,
+                "created_epoch": session.created_epoch,
+            }
+        )
+
+    async def delete_session(self, request: web.Request) -> web.Response:
+        sid = request.match_info["session_id"]
+        session = self._get_session(sid)
+        if session is None:
+            return web.json_response({"error": "session not found"}, status=404)
+        if session.inbound_task is not None:
+            session.inbound_task.cancel()
+        if session.pc is not None:
+            with contextlib.suppress(Exception):
+                await session.pc.close()
+            self.pcs.discard(session.pc)
+        if session.pcid:
+            self.pc_states[session.pcid] = "closed"
+        del self.sessions[sid]
+        return web.json_response({"ok": True, "session_id": sid})
+
+    async def session_stats(self, request: web.Request) -> web.Response:
+        sid = request.match_info["session_id"]
+        session = self._get_session(sid)
+        if session is None:
+            return web.json_response({"error": "session not found"}, status=404)
+        return web.json_response(self._session_payload(session))
+
+    def _session_payload(self, session: SessionState) -> dict:
+        return {
+            "session_id": session.session_id,
+            "created_epoch": session.created_epoch,
+            "pc_state": self.pc_states.get(session.pcid or "", "new"),
+            "mic_frames_rx": session.mic_frames_rx,
+            "mic_samples_rx_16k": session.mic_samples_rx_16k,
+            "last_mic_rx_epoch": session.last_mic_rx_epoch or None,
+        }
+
     async def offer(self, request: web.Request) -> web.Response:
+        session = self._create_session()
+        return await self._handle_offer(request, session=session)
+
+    async def session_offer(self, request: web.Request) -> web.Response:
+        sid = request.match_info["session_id"]
+        session = self._get_session(sid)
+        if session is None:
+            return web.json_response({"error": "session not found"}, status=404)
+        return await self._handle_offer(request, session=session)
+
+    async def _handle_offer(self, request: web.Request, session: SessionState) -> web.Response:
         if not AIORTC_AVAILABLE:
             return web.json_response(
                 {"error": "aiortc/av not installed. Install: pip install aiortc av"},
@@ -732,11 +825,17 @@ class WebRtcApp:
             )
         params = await request.json()
         offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
+        if session.pc is not None:
+            with contextlib.suppress(Exception):
+                await session.pc.close()
+            self.pcs.discard(session.pc)
 
         pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=self._aiortc_ice_servers()))
         self.pcs.add(pc)
         pcid = f"pc_{id(pc)}"
         self.pc_states[pcid] = pc.connectionState
+        session.pc = pc
+        session.pcid = pcid
 
         @pc.on("connectionstatechange")
         async def on_connectionstatechange():
@@ -745,6 +844,16 @@ class WebRtcApp:
                 await pc.close()
                 self.pcs.discard(pc)
                 self.pc_states[pcid] = "closed"
+                if session.inbound_task is not None:
+                    session.inbound_task.cancel()
+
+        @pc.on("track")
+        async def on_track(track):
+            if getattr(track, "kind", "") != "audio":
+                return
+            if session.inbound_task is not None:
+                session.inbound_task.cancel()
+            session.inbound_task = asyncio.create_task(self._consume_inbound_audio(track, session))
 
         video_track = MuseTalkVideoTrack(self.video_buffer, fps=self.args.fps, stats=self.track_stats)
         audio_track = MuseTalkAudioTrack(self.audio_track_buffer, stats=self.track_stats)
@@ -757,8 +866,59 @@ class WebRtcApp:
         await self._wait_for_ice_gathering(pc, timeout=3.0)
 
         return web.json_response(
-            {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
+            {
+                "session_id": session.session_id,
+                "sdp": pc.localDescription.sdp,
+                "type": pc.localDescription.type,
+            }
         )
+
+    async def _consume_inbound_audio(self, track, session: SessionState) -> None:
+        while True:
+            frame = await track.recv()
+            pcm = frame.to_ndarray()
+            pcm = np.asarray(pcm)
+            if pcm.ndim == 2:
+                pcm = pcm.mean(axis=0)
+            pcm = pcm.reshape(-1).astype(np.float32, copy=False)
+            fmt_name = str(getattr(getattr(frame, "format", None), "name", "")).lower()
+            if fmt_name.startswith(("s16", "s32", "u8")):
+                pcm = pcm / 32768.0
+            src_sr = int(getattr(frame, "sample_rate", 48000) or 48000)
+            if pcm.size == 0:
+                continue
+
+            pcm16k = self._resample_audio(pcm, src_sr, 16000)
+            session.mic_samples_rx_16k += int(pcm16k.size)
+            session.mic_frames_rx += 1
+            session.last_mic_rx_epoch = time.time()
+
+            if self.args.input_source in ("webrtc", "mixed"):
+                await self.pcm_ring_16k.append(pcm16k)
+
+            if self.args.webrtc_audio_loopback:
+                pcm24k = self._resample_audio(pcm, src_sr, 24000)
+                await self.pcm_ring_24k.append(pcm24k)
+                await self.audio_track_buffer.append_from_24k(pcm24k)
+
+    def _resample_audio(self, pcm: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
+        if src_sr == dst_sr:
+            return pcm.astype(np.float32, copy=False)
+        if src_sr <= 0 or dst_sr <= 0:
+            return np.zeros((0,), dtype=np.float32)
+        return resample_poly(pcm, up=dst_sr, down=src_sr).astype(np.float32, copy=False)
+
+    @web.middleware
+    async def auth_middleware(self, request: web.Request, handler):
+        if not self.args.enable_api_auth:
+            return await handler(request)
+        if not request.path.startswith("/v1/"):
+            return await handler(request)
+        auth = request.headers.get("authorization", "")
+        expected = f"Bearer {self.args.api_token}"
+        if not self.args.api_token or auth != expected:
+            return web.json_response({"error": "unauthorized"}, status=401)
+        return await handler(request)
 
     async def _wait_for_ice_gathering(self, pc: RTCPeerConnection, timeout: float) -> None:
         if pc.iceGatheringState == "complete":
@@ -774,7 +934,7 @@ class WebRtcApp:
             await asyncio.wait_for(done.wait(), timeout=timeout)
 
     def build_app(self) -> web.Application:
-        app = web.Application()
+        app = web.Application(middlewares=[self.auth_middleware])
         app.on_startup.append(self.on_startup)
         app.on_cleanup.append(self.on_cleanup)
         app.router.add_get("/", self.index)
@@ -782,6 +942,10 @@ class WebRtcApp:
         app.router.add_get("/status", self.status)
         app.router.add_get("/snapshot.jpg", self.snapshot)
         app.router.add_post("/offer", self.offer)
+        app.router.add_post("/v1/sessions", self.create_session)
+        app.router.add_post("/v1/sessions/{session_id}/offer", self.session_offer)
+        app.router.add_get("/v1/sessions/{session_id}/stats", self.session_stats)
+        app.router.add_delete("/v1/sessions/{session_id}", self.delete_session)
         return app
 
 
@@ -849,6 +1013,29 @@ def parse_args() -> AppArgs:
     parser.add_argument("--video-queue-size", type=int, default=256)
     parser.add_argument("--reconnect-delay-seconds", type=float, default=1.0)
     parser.add_argument(
+        "--input-source",
+        type=str,
+        default="mirror",
+        choices=["mirror", "webrtc", "mixed"],
+        help="Audio input path for driving MuseTalk: mirror websocket, WebRTC uplink, or both.",
+    )
+    parser.add_argument(
+        "--webrtc-audio-loopback",
+        action="store_true",
+        help="Loop inbound WebRTC mic audio back to outbound avatar audio track for MVP testing.",
+    )
+    parser.add_argument(
+        "--enable-api-auth",
+        action="store_true",
+        help="Scaffold auth for /v1 endpoints. Disabled by default.",
+    )
+    parser.add_argument(
+        "--api-token",
+        type=str,
+        default="",
+        help="Bearer token used when --enable-api-auth is set.",
+    )
+    parser.add_argument(
         "--status-json",
         type=str,
         default="data/live/in_memory_pipeline_status.json",
@@ -899,6 +1086,10 @@ def parse_args() -> AppArgs:
         video_queue_size=ns.video_queue_size,
         status_json=status_json,
         reconnect_delay_seconds=ns.reconnect_delay_seconds,
+        input_source=ns.input_source,
+        webrtc_audio_loopback=ns.webrtc_audio_loopback,
+        enable_api_auth=ns.enable_api_auth,
+        api_token=ns.api_token,
     )
 
 
@@ -909,7 +1100,13 @@ def main():
     app_state = WebRtcApp(args)
     app = app_state.build_app()
     print(f"[webrtc] serving http://{args.host}:{args.port}/")
-    print("[webrtc] endpoint /offer for SDP exchange, /status for diagnostics")
+    print(
+        "[webrtc] endpoints: /offer (legacy), /v1/sessions (create), "
+        "/v1/sessions/{id}/offer (MVP duplex), /status (diagnostics)"
+    )
+    print(f"[webrtc] input_source={args.input_source} webrtc_audio_loopback={args.webrtc_audio_loopback}")
+    if args.enable_api_auth:
+        print("[webrtc] /v1 auth middleware enabled")
     web.run_app(app, host=args.host, port=args.port)
 
 

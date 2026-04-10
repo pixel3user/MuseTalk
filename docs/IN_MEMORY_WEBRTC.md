@@ -38,6 +38,21 @@ Open:
 - `http://<host>:8780/` (preview client)
 - `http://<host>:8780/status` (diagnostics)
 
+## MVP cloud signaling API (for native clients)
+
+In addition to legacy `POST /offer`, the server now exposes session-based endpoints:
+
+- `POST /v1/sessions` -> create a session and return `{session_id, token}`
+- `POST /v1/sessions/{session_id}/offer` -> submit SDP offer and receive SDP answer
+- `GET /v1/sessions/{session_id}/stats` -> per-session media counters
+- `DELETE /v1/sessions/{session_id}` -> teardown
+
+Useful flags for MVP duplex bring-up:
+
+- `--input-source mirror|webrtc|mixed` (default: `mirror`)
+- `--webrtc-audio-loopback` (echo inbound WebRTC mic to outbound audio track for testing)
+- `--enable-api-auth` + `--api-token` (auth scaffold; off by default)
+
 ## Fixing "WebRTC stuck at connecting" on cloud
 
 When server and browser are on different networks (NAT/proxy), host ICE candidates are often unreachable.
