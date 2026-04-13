@@ -99,7 +99,8 @@ class PersonaPlexMirrorClient:
                             if msg.type != aiohttp.WSMsgType.BINARY:
                                 continue
                             data = msg.data
-                            if not isinstance(data, (bytes, bytearray)) or len(data) < 2:
+                            # Handshake packets are a single byte (kind=0), so allow len==1.
+                            if not isinstance(data, (bytes, bytearray)) or len(data) < 1:
                                 continue
                             kind = data[0]
                             payload = bytes(data[1:])
@@ -183,6 +184,10 @@ class PersonaPlexChatBridge:
 
         if pcm24k.size == 0:
             return
+        # PersonaPlex only accepts audio after its startup/system-prompt handshake.
+        # Dropping pre-handshake mic avoids building stale backlog and reconnect churn.
+        if not self.handshake.is_set():
+            return
         item = pcm24k.astype(np.float32, copy=False).copy()
         if self.uplink_queue.full():
             with contextlib.suppress(asyncio.QueueEmpty):
@@ -211,7 +216,8 @@ class PersonaPlexChatBridge:
             if msg.type != aiohttp.WSMsgType.BINARY:
                 continue
             data = msg.data
-            if not isinstance(data, (bytes, bytearray)) or len(data) < 2:
+            # Handshake packets are a single byte (kind=0), so allow len==1.
+            if not isinstance(data, (bytes, bytearray)) or len(data) < 1:
                 continue
             kind = data[0]
             payload = bytes(data[1:])
@@ -258,8 +264,12 @@ class PersonaPlexChatBridge:
         - `None` (loop exits on stop/close).
         """
 
-        with contextlib.suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(self.handshake.wait(), timeout=8.0)
+        # On CPU-only environments PersonaPlex can take significant time to finish
+        # system prompts before emitting handshake; wait without a hard timeout.
+        while not self.stop_event.is_set() and not ws.closed and not self.handshake.is_set():
+            await asyncio.sleep(0.05)
+        if not self.handshake.is_set():
+            return
         while not self.stop_event.is_set() and not ws.closed:
             try:
                 pcm24k = await asyncio.wait_for(self.uplink_queue.get(), timeout=0.25)
