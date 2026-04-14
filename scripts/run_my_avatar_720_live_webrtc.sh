@@ -52,6 +52,9 @@ fi
 if [[ "${WEB_TEST_ONLY:-0}" == "1" ]]; then
   EXTRA_ARGS+=(--web-test-only)
 fi
+if [[ "${MUSETALK_ONLY:-0}" == "1" ]]; then
+  EXTRA_ARGS+=(--musetalk-only --input-source webrtc)
+fi
 if [[ "${DEBUG_WEBRTC:-0}" == "1" ]]; then
   EXTRA_ARGS+=(--debug)
 fi

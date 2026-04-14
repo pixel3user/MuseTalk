@@ -95,6 +95,11 @@ def parse_args() -> AppArgs:
         help="Loop inbound WebRTC mic audio back to outbound avatar audio track for MVP testing.",
     )
     parser.add_argument(
+        "--musetalk-only",
+        action="store_true",
+        help="Disable PersonaPlex I/O and drive lipsync directly from inbound WebRTC mic audio.",
+    )
+    parser.add_argument(
         "--enable-api-auth",
         action="store_true",
         help="Scaffold auth for /v1 endpoints. Disabled by default.",
@@ -197,6 +202,7 @@ def parse_args() -> AppArgs:
         reconnect_delay_seconds=ns.reconnect_delay_seconds,
         input_source=ns.input_source,
         webrtc_audio_loopback=ns.webrtc_audio_loopback,
+        musetalk_only=ns.musetalk_only,
         enable_api_auth=ns.enable_api_auth,
         api_token=ns.api_token,
         session_offer_timeout_seconds=ns.session_offer_timeout_seconds,
@@ -229,6 +235,8 @@ def main():
         "/v1/sessions (create), /v1/sessions/{id}/offer, /v1/sessions/{id}/stats, /status"
     )
     print(f"[webrtc] input_source={args.input_source} webrtc_audio_loopback={args.webrtc_audio_loopback}")
+    if args.musetalk_only:
+        print("[webrtc] musetalk-only mode enabled (no PersonaPlex connections).")
     print(f"[webrtc] single_session_mode={args.single_session_mode} session_token_header={SESSION_TOKEN_HEADER}")
     print(f"[webrtc] personaplex_path={args.personaplex_path} chat_mode={chat_mode}")
     if args.web_test_only:
@@ -238,4 +246,3 @@ def main():
     if args.debug:
         print(f"[webrtc] debug mode enabled (events_limit={args.debug_events_limit})")
     web.run_app(app, host=args.host, port=args.port)
-

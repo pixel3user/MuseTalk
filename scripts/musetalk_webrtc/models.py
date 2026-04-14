@@ -64,6 +64,7 @@ class AppArgs:
     reconnect_delay_seconds: float
     input_source: str
     webrtc_audio_loopback: bool
+    musetalk_only: bool
     enable_api_auth: bool
     api_token: str
     session_offer_timeout_seconds: float

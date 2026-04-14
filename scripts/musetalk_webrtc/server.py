@@ -68,7 +68,7 @@ class WebRtcApp:
         self.mirror_client: Optional[PersonaPlexMirrorClient] = None
         self.engine: Optional[MuseTalkRealtimeEngine] = None
         if not args.web_test_only:
-            if not self._personaplex_chat_enabled():
+            if (not args.musetalk_only) and (not self._personaplex_chat_enabled()):
                 ws_url = self._build_mirror_ws_url()
                 self.mirror_client = PersonaPlexMirrorClient(
                     ws_url=ws_url,
@@ -93,7 +93,7 @@ class WebRtcApp:
     def _personaplex_chat_enabled(self) -> bool:
         """Return True when configured for `/api/chat` duplex mode."""
 
-        if self.args.web_test_only:
+        if self.args.web_test_only or self.args.musetalk_only:
             return False
         return self.args.personaplex_path.rstrip("/").endswith("/api/chat")
 
