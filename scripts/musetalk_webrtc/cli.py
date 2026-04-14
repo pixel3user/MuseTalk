@@ -221,7 +221,11 @@ def main():
     args = parse_args()
     if not AIORTC_AVAILABLE:
         raise SystemExit("aiortc/av is required for WebRTC output. Install with: pip install aiortc av")
-    chat_mode = (not args.web_test_only) and args.personaplex_path.rstrip("/").endswith("/api/chat")
+    chat_mode = (
+        (not args.web_test_only)
+        and (not args.musetalk_only)
+        and args.personaplex_path.rstrip("/").endswith("/api/chat")
+    )
     if chat_mode and not str(args.personaplex_voice_prompt).strip():
         print(
             "[webrtc][warn] personaplex_path=/api/chat but --personaplex-voice-prompt is empty. "
