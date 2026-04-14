@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import math
+import os
 import shutil
 import time
 
@@ -115,6 +116,12 @@ class MuseTalkRealtimeEngine:
             raise RuntimeError("mmpose/DWPose is required but unavailable.")
         if not rt.MMPOSE_AVAILABLE:
             print("[engine][warn] mmpose unavailable; using fallback face detector.")
+        vae_config = os.path.join("models", rt.args.vae_type, "config.json")
+        if not os.path.exists(vae_config):
+            raise FileNotFoundError(
+                f"Missing VAE config: {vae_config}. Download weights with ./download_weights.sh "
+                "or set --vae-type to a valid local VAE directory under ./models."
+            )
 
         rt.vae, rt.unet, rt.pe = rt.load_all_model(
             unet_model_path=rt.args.unet_model_path,
