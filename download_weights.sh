@@ -8,7 +8,7 @@ CheckpointsDir="models"
 # Optional prepared-avatar restore (enabled by default).
 # Set RESULTS_RESTORE=0 to skip.
 RESULTS_RESTORE="${RESULTS_RESTORE:-1}"
-RESULTS_ARCHIVE_URL="${RESULTS_ARCHIVE_URL:-https://drive.google.com/open?id=12aWbN28KSYCb3c9YJQxxLLi3I-6PSAnv}"
+RESULTS_ARCHIVE_URL="${RESULTS_ARCHIVE_URL:-https://firebasestorage.googleapis.com/v0/b/farm2market-99.firebasestorage.app/o/my_avatar_720_live.tar?alt=media&token=bd59a3ca-787c-40f6-a064-a9619b707b4c}"
 RESULTS_EXTRACT_DIR="${RESULTS_EXTRACT_DIR:-results/v15/avatars}"
 RESULTS_AVATAR_ID="${RESULTS_AVATAR_ID:-my_avatar_720_live}"
 
@@ -23,40 +23,45 @@ pip install gdown
 export HF_ENDPOINT=https://hf-mirror.com
 
 # Download MuseTalk V1.0 weights
-huggingface-cli download TMElyralab/MuseTalk \
-  "musetalk/musetalk.json" "musetalk/pytorch_model.bin" \
+hf download TMElyralab/MuseTalk \
   --local-dir $CheckpointsDir \
-  --repo-type model
+  --repo-type model \
+  --include "musetalk/musetalk.json" \
+  --include "musetalk/pytorch_model.bin"
 
 # Download MuseTalk V1.5 weights (unet.pth)
-huggingface-cli download TMElyralab/MuseTalk \
-  "musetalkV15/musetalk.json" "musetalkV15/unet.pth" \
+hf download TMElyralab/MuseTalk \
   --local-dir $CheckpointsDir \
-  --repo-type model
+  --repo-type model \
+  --include "musetalkV15/musetalk.json" \
+  --include "musetalkV15/unet.pth"
 
 # Download SD VAE weights
-huggingface-cli download stabilityai/sd-vae-ft-mse \
-  "config.json" "diffusion_pytorch_model.bin" \
+hf download stabilityai/sd-vae-ft-mse \
   --local-dir $CheckpointsDir/sd-vae \
-  --repo-type model
+  --repo-type model \
+  --include "config.json" \
+  --include "diffusion_pytorch_model.bin"
 
 # Download Whisper weights
-huggingface-cli download openai/whisper-tiny \
-  "config.json" "pytorch_model.bin" "preprocessor_config.json" \
+hf download openai/whisper-tiny \
   --local-dir $CheckpointsDir/whisper \
-  --repo-type model
+  --repo-type model \
+  --include "config.json" \
+  --include "pytorch_model.bin" \
+  --include "preprocessor_config.json"
 
 # Download DWPose weights
-huggingface-cli download yzd-v/DWPose \
-  "dw-ll_ucoco_384.pth" \
+hf download yzd-v/DWPose \
   --local-dir $CheckpointsDir/dwpose \
-  --repo-type model
+  --repo-type model \
+  --include "dw-ll_ucoco_384.pth"
 
 # Download SyncNet weights
-huggingface-cli download ByteDance/LatentSync \
-  "latentsync_syncnet.pt" \
+hf download ByteDance/LatentSync \
   --local-dir $CheckpointsDir/syncnet \
-  --repo-type model
+  --repo-type model \
+  --include "latentsync_syncnet.pt"
 
 # Download Face Parse Bisent weights
 gdown --id 154JgKpzCPW82qINcVieuPH3fZ2e0P812 -O $CheckpointsDir/face-parse-bisent/79999_iter.pth
@@ -88,7 +93,7 @@ if [ "$RESULTS_RESTORE" = "1" ]; then
   tmp_archive="$(mktemp /tmp/${RESULTS_AVATAR_ID}.XXXXXX.tar)"
 
   echo "Downloading prepared avatar archive for '${RESULTS_AVATAR_ID}'..."
-  gdown --fuzzy "$RESULTS_ARCHIVE_URL" -O "$tmp_archive"
+  curl -L "$RESULTS_ARCHIVE_URL" -o "$tmp_archive"
 
   echo "Extracting archive to: $RESULTS_EXTRACT_DIR"
   tar -xf "$tmp_archive" -C "$RESULTS_EXTRACT_DIR"
