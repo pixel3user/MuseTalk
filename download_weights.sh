@@ -64,7 +64,7 @@ hf download ByteDance/LatentSync \
   --include "latentsync_syncnet.pt"
 
 # Download Face Parse Bisent weights
-gdown --id 154JgKpzCPW82qINcVieuPH3fZ2e0P812 -O $CheckpointsDir/face-parse-bisent/79999_iter.pth
+gdown https://drive.google.com/uc?id=154JgKpzCPW82qINcVieuPH3fZ2e0P812 -O $CheckpointsDir/face-parse-bisent/79999_iter.pth
 curl -L https://download.pytorch.org/models/resnet18-5c106cde.pth \
   -o $CheckpointsDir/face-parse-bisent/resnet18-5c106cde.pth
 
