@@ -227,6 +227,34 @@ Install the remaining required packages:
 pip install -r requirements.txt
 ```
 
+### Linux System Packages for OpenCV (WebRTC/Server)
+If you run MuseTalk on a Linux server/container, OpenCV may fail with:
+`ImportError: libGL.so.1: cannot open shared object file`.
+
+Install these system libraries:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y libgl1 libglib2.0-0
+```
+
+If your distro/image still reports OpenCV GUI loader errors, also install:
+
+```bash
+sudo apt-get install -y libsm6 libxext6 libxrender1
+```
+
+#### Headless vs non-headless OpenCV
+- **Server/headless deployment (recommended):** use `opencv-python-headless` to reduce GUI/libGL issues.
+- **Desktop/local visualization:** keep `opencv-python` and install the Linux system packages above.
+
+To switch an existing environment to headless OpenCV:
+
+```bash
+pip uninstall -y opencv-python
+pip install opencv-python-headless==4.9.0.80
+```
+
 ### Install MMLab Packages
 Install the MMLab ecosystem packages:
 
