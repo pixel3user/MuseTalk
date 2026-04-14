@@ -2,11 +2,14 @@
 
 import argparse
 import asyncio
+import math
+import shutil
 import time
 
 import cv2
 import numpy as np
 import torch
+from einops import rearrange
 
 from .buffers import PcmRingBuffer, VideoFrameBuffer
 from .models import AppArgs
@@ -42,6 +45,8 @@ class MuseTalkRealtimeEngine:
         self.last_publish_epoch = 0.0
         self.last_error = ""
         self.prev_mouth_patch = None
+        self._whisper_feature_cache = None
+        self._cache_audio_samples = 0
 
         import scripts.realtime_inference as rt
 
@@ -101,6 +106,10 @@ class MuseTalkRealtimeEngine:
             require_mmpose=self.args.require_mmpose,
         )
         rt.device = torch.device(f"cuda:{self.args.gpu_id}" if torch.cuda.is_available() else "cpu")
+        if rt.device.type != "cuda":
+            print("[engine][warn] CUDA is unavailable; realtime inference will be very slow on CPU.")
+        if not shutil.which("ffmpeg"):
+            print("[engine][warn] ffmpeg not found in PATH (not required for core realtime generation).")
 
         if rt.args.require_mmpose and not rt.MMPOSE_AVAILABLE:
             raise RuntimeError("mmpose/DWPose is required but unavailable.")
@@ -125,6 +134,12 @@ class MuseTalkRealtimeEngine:
             rt.vae.vae = rt.vae.vae.float().to(rt.device)
             rt.unet.model = rt.unet.model.float().to(rt.device)
             print("[engine] precision: fp32")
+        rt.pe.eval()
+        rt.vae.vae.eval()
+        rt.unet.model.eval()
+        rt.pe.requires_grad_(False)
+        rt.vae.vae.requires_grad_(False)
+        rt.unet.model.requires_grad_(False)
 
         rt.audio_processor = rt.AudioProcessor(feature_extractor_path=rt.args.whisper_dir)
         rt.weight_dtype = rt.unet.model.dtype
@@ -140,7 +155,108 @@ class MuseTalkRealtimeEngine:
         else:
             rt.fp = rt.FaceParsing()
 
-    def _infer_window_frames(self, pcm16k_window: np.ndarray, new_frames: int) -> list[np.ndarray]:
+    @torch.no_grad()
+    def _append_whisper_cache(self, new_pcm16k: np.ndarray) -> None:
+        """Incrementally append Whisper hidden features for only the newest audio."""
+
+        if new_pcm16k.size == 0:
+            return
+        rt = self.rt
+        feature_ret = rt.audio_processor.get_audio_feature_from_array(
+            new_pcm16k, sample_rate=16000, weight_dtype=rt.weight_dtype
+        )
+        if feature_ret is None:
+            return
+        whisper_input_features, _ = feature_ret
+        new_hidden = []
+        for input_feature in whisper_input_features:
+            input_feature = input_feature.to(rt.device).to(rt.weight_dtype)
+            audio_feats = rt.whisper.encoder(input_feature, output_hidden_states=True).hidden_states
+            audio_feats = torch.stack(audio_feats, dim=2)
+            new_hidden.append(audio_feats)
+        if not new_hidden:
+            return
+        appended = torch.cat(new_hidden, dim=1)
+        if self._whisper_feature_cache is None:
+            self._whisper_feature_cache = appended
+        else:
+            self._whisper_feature_cache = torch.cat([self._whisper_feature_cache, appended], dim=1)
+        self._cache_audio_samples += int(new_pcm16k.size)
+
+        # Keep only a bounded recent cache (window + safety margin).
+        keep_ms = max(
+            int(self.args.window_ms + self.args.min_window_ms + self.args.max_advance_ms + 200),
+            1000,
+        )
+        keep_samples = int((keep_ms / 1000.0) * 16000)
+        if self._cache_audio_samples <= keep_samples:
+            return
+        drop_samples = self._cache_audio_samples - keep_samples
+        drop_frames = max(0, int(math.floor((drop_samples / 16000.0) * 50.0)))
+        if drop_frames > 0 and self._whisper_feature_cache is not None:
+            self._whisper_feature_cache = self._whisper_feature_cache[:, drop_frames:, ...]
+        self._cache_audio_samples = keep_samples
+
+    @torch.no_grad()
+    def _tail_whisper_chunks(self, new_frames: int) -> torch.Tensor | None:
+        """Build only tail Whisper chunks from cached hidden states."""
+
+        if self._whisper_feature_cache is None:
+            return None
+        rt = self.rt
+        sr = 16000
+        audio_fps = 50
+        fps = int(self.args.fps)
+        if fps <= 0:
+            return None
+        whisper_idx_multiplier = audio_fps / fps
+        num_frames_total = math.floor((self._cache_audio_samples / sr) * fps)
+        if num_frames_total <= 0:
+            return None
+        tail = max(1, min(int(new_frames), int(self.args.max_tail_frames), num_frames_total))
+        start_frame = max(0, num_frames_total - tail)
+        audio_feature_length_per_frame = 2 * (
+            self.args.audio_padding_length_left + self.args.audio_padding_length_right + 1
+        )
+
+        actual_length = min(
+            self._whisper_feature_cache.shape[1],
+            max(0, math.floor((self._cache_audio_samples / sr) * audio_fps)),
+        )
+        whisper_feature = self._whisper_feature_cache[:, :actual_length, ...]
+        if whisper_feature.shape[1] <= 0:
+            return None
+
+        padding_nums = math.ceil(whisper_idx_multiplier)
+        whisper_feature = torch.cat(
+            [
+                torch.zeros_like(whisper_feature[:, : padding_nums * self.args.audio_padding_length_left]),
+                whisper_feature,
+                torch.zeros_like(whisper_feature[:, : padding_nums * 3 * self.args.audio_padding_length_right]),
+            ],
+            1,
+        )
+
+        audio_prompts = []
+        for frame_index in range(start_frame, num_frames_total):
+            audio_index = math.floor(frame_index * whisper_idx_multiplier)
+            audio_clip = whisper_feature[:, audio_index : audio_index + audio_feature_length_per_frame]
+            if audio_clip.shape[1] != audio_feature_length_per_frame:
+                continue
+            audio_prompts.append(audio_clip)
+        if not audio_prompts:
+            return None
+        audio_prompts = torch.cat(audio_prompts, dim=0)
+        audio_prompts = rearrange(audio_prompts, "b c h w -> b (c h) w")
+        return audio_prompts
+
+    @torch.no_grad()
+    def _infer_window_frames(
+        self,
+        pcm16k_window: np.ndarray,
+        new_frames: int,
+        advance_samples: int,
+    ) -> list[np.ndarray]:
         """Run one inference pass and return only the newest tail frames.
 
         Receives:
@@ -151,26 +267,15 @@ class MuseTalkRealtimeEngine:
         - List of BGR frames (can be empty when features are unavailable).
         """
 
-        rt = self.rt
-        feature_ret = rt.audio_processor.get_audio_feature_from_array(
-            pcm16k_window, sample_rate=16000, weight_dtype=rt.weight_dtype
-        )
-        if feature_ret is None:
+        if advance_samples <= 0:
             return []
-        whisper_input_features, librosa_length = feature_ret
-        whisper_chunks = rt.audio_processor.get_whisper_chunk(
-            whisper_input_features,
-            rt.device,
-            rt.weight_dtype,
-            rt.whisper,
-            librosa_length,
-            fps=self.args.fps,
-            audio_padding_length_left=self.args.audio_padding_length_left,
-            audio_padding_length_right=self.args.audio_padding_length_right,
-        )
+        tail_n = max(1, min(int(advance_samples), int(pcm16k_window.size)))
+        self._append_whisper_cache(pcm16k_window[-tail_n:])
+        whisper_chunks = self._tail_whisper_chunks(new_frames)
         if whisper_chunks is None or len(whisper_chunks) == 0:
             return []
 
+        rt = self.rt
         combined_frames = []
         gen = rt.datagen(whisper_chunks, self.avatar.input_latent_list_cycle, self.args.batch_size)
         for whisper_batch, latent_batch in gen:
@@ -252,7 +357,7 @@ class MuseTalkRealtimeEngine:
             new_frames = max(1, int(round((new_samples / 16000.0) * self.args.fps)))
             new_frames = min(new_frames, max(1, self.args.max_tail_frames))
             try:
-                frames = await asyncio.to_thread(self._infer_window_frames, window, new_frames)
+                frames = await asyncio.to_thread(self._infer_window_frames, window, new_frames, new_samples)
                 for frame in frames:
                     await self.video_buffer.publish(frame)
                     self.last_publish_epoch = time.time()
@@ -279,4 +384,3 @@ class MuseTalkRealtimeEngine:
             "avatar_frame_idx": self.avatar_frame_idx,
             "dropped_audio_ms_total": round(self.dropped_audio_ms_total, 1),
         }
-
