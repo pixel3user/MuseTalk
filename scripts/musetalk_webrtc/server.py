@@ -68,7 +68,7 @@ class WebRtcApp:
         self.mirror_client: Optional[PersonaPlexMirrorClient] = None
         self.engine: Optional[MuseTalkRealtimeEngine] = None
         if not args.web_test_only:
-            if not self._personaplex_chat_enabled():
+            if (not args.musetalk_only) and (not self._personaplex_chat_enabled()):
                 ws_url = self._build_mirror_ws_url()
                 self.mirror_client = PersonaPlexMirrorClient(
                     ws_url=ws_url,
@@ -93,7 +93,7 @@ class WebRtcApp:
     def _personaplex_chat_enabled(self) -> bool:
         """Return True when configured for `/api/chat` duplex mode."""
 
-        if self.args.web_test_only:
+        if self.args.web_test_only or self.args.musetalk_only:
             return False
         return self.args.personaplex_path.rstrip("/").endswith("/api/chat")
 
@@ -777,8 +777,13 @@ class WebRtcApp:
                 frame = await track.recv()
                 pcm = frame.to_ndarray()
                 pcm = np.asarray(pcm)
-                if pcm.ndim == 2:
-                    pcm = pcm.mean(axis=0)
+                channels = len(frame.layout.channels)
+                if channels > 1:
+                    if getattr(frame.format, "is_planar", False):
+                        pcm = pcm.mean(axis=0)
+                    else:
+                        pcm = pcm.reshape(-1, channels).mean(axis=1)
+
                 pcm = pcm.reshape(-1).astype(np.float32, copy=False)
                 fmt_name = str(getattr(getattr(frame, "format", None), "name", "")).lower()
                 if fmt_name.startswith(("s16", "s32", "u8")):

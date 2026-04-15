@@ -54,6 +54,7 @@ def parse_args() -> AppArgs:
     parser.add_argument("--use-fp16", action="store_true")
     parser.add_argument("--require-mmpose", action="store_true")
     parser.add_argument("--fps", type=int, default=20)
+    parser.add_argument("--avatar-fps", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--bbox-shift", type=int, default=0)
     parser.add_argument("--unet-model-path", type=str, default="models/musetalkV15/unet.pth")
@@ -93,6 +94,11 @@ def parse_args() -> AppArgs:
         "--webrtc-audio-loopback",
         action="store_true",
         help="Loop inbound WebRTC mic audio back to outbound avatar audio track for MVP testing.",
+    )
+    parser.add_argument(
+        "--musetalk-only",
+        action="store_true",
+        help="Disable PersonaPlex I/O and drive lipsync directly from inbound WebRTC mic audio.",
     )
     parser.add_argument(
         "--enable-api-auth",
@@ -172,6 +178,7 @@ def parse_args() -> AppArgs:
         use_fp16=ns.use_fp16,
         require_mmpose=ns.require_mmpose,
         fps=ns.fps,
+        avatar_fps=ns.avatar_fps,
         batch_size=ns.batch_size,
         bbox_shift=ns.bbox_shift,
         unet_model_path=ns.unet_model_path,
@@ -197,6 +204,7 @@ def parse_args() -> AppArgs:
         reconnect_delay_seconds=ns.reconnect_delay_seconds,
         input_source=ns.input_source,
         webrtc_audio_loopback=ns.webrtc_audio_loopback,
+        musetalk_only=ns.musetalk_only,
         enable_api_auth=ns.enable_api_auth,
         api_token=ns.api_token,
         session_offer_timeout_seconds=ns.session_offer_timeout_seconds,
@@ -215,7 +223,11 @@ def main():
     args = parse_args()
     if not AIORTC_AVAILABLE:
         raise SystemExit("aiortc/av is required for WebRTC output. Install with: pip install aiortc av")
-    chat_mode = (not args.web_test_only) and args.personaplex_path.rstrip("/").endswith("/api/chat")
+    chat_mode = (
+        (not args.web_test_only)
+        and (not args.musetalk_only)
+        and args.personaplex_path.rstrip("/").endswith("/api/chat")
+    )
     if chat_mode and not str(args.personaplex_voice_prompt).strip():
         print(
             "[webrtc][warn] personaplex_path=/api/chat but --personaplex-voice-prompt is empty. "
@@ -229,6 +241,8 @@ def main():
         "/v1/sessions (create), /v1/sessions/{id}/offer, /v1/sessions/{id}/stats, /status"
     )
     print(f"[webrtc] input_source={args.input_source} webrtc_audio_loopback={args.webrtc_audio_loopback}")
+    if args.musetalk_only:
+        print("[webrtc] musetalk-only mode enabled (no PersonaPlex connections).")
     print(f"[webrtc] single_session_mode={args.single_session_mode} session_token_header={SESSION_TOKEN_HEADER}")
     print(f"[webrtc] personaplex_path={args.personaplex_path} chat_mode={chat_mode}")
     if args.web_test_only:
@@ -238,4 +252,3 @@ def main():
     if args.debug:
         print(f"[webrtc] debug mode enabled (events_limit={args.debug_events_limit})")
     web.run_app(app, host=args.host, port=args.port)
-

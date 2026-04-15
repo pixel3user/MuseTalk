@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+
 cd "$(dirname "$0")/.."
 
 EXTRA_ARGS=()
@@ -51,6 +52,9 @@ if [[ "${REQUIRE_MMPOSE:-0}" == "1" ]]; then
 fi
 if [[ "${WEB_TEST_ONLY:-0}" == "1" ]]; then
   EXTRA_ARGS+=(--web-test-only)
+fi
+if [[ "${MUSETALK_ONLY:-0}" == "1" ]]; then
+  EXTRA_ARGS+=(--musetalk-only --input-source webrtc --webrtc-audio-loopback)
 fi
 if [[ "${DEBUG_WEBRTC:-0}" == "1" ]]; then
   EXTRA_ARGS+=(--debug)

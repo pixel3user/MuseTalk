@@ -94,19 +94,64 @@ def get_image(image, face, face_box, upper_boundary_ratio=0.5, expand=1.5, mode=
 
 
 def get_image_blending(image, face, face_box, mask_array, crop_box):
-    body = Image.fromarray(image[:,:,::-1])
-    face = Image.fromarray(face[:,:,::-1])
-
+    # This falls back to the exact PIL math while still being much faster than the old approach
     x, y, x1, y1 = face_box
     x_s, y_s, x_e, y_e = crop_box
-    face_large = body.crop(crop_box)
 
-    mask_image = Image.fromarray(mask_array)
-    mask_image = mask_image.convert("L")
-    face_large.paste(face, (x-x_s, y-y_s, x1-x_s, y1-y_s))
-    body.paste(face_large, crop_box[:2], mask_image)
-    body = np.array(body)
-    return body[:,:,::-1]
+    h_img, w_img = image.shape[:2]
+
+    pad_t = max(0, -y_s)
+    pad_b = max(0, y_e - h_img)
+    pad_l = max(0, -x_s)
+    pad_r = max(0, x_e - w_img)
+
+    if pad_t > 0 or pad_b > 0 or pad_l > 0 or pad_r > 0:
+        padded_img = cv2.copyMakeBorder(image, pad_t, pad_b, pad_l, pad_r, cv2.BORDER_CONSTANT, value=[0, 0, 0])
+    else:
+        padded_img = image.copy()
+
+    p_x_s = x_s + pad_l
+    p_y_s = y_s + pad_t
+    p_x_e = x_e + pad_l
+    p_y_e = y_e + pad_t
+
+    p_x = x + pad_l
+    p_y = y + pad_t
+    p_x1 = x1 + pad_l
+    p_y1 = y1 + pad_t
+
+    face_large = padded_img[p_y_s:p_y_e, p_x_s:p_x_e].copy()
+
+    face_y_start, face_y_end = p_y - p_y_s, p_y1 - p_y_s
+    face_x_start, face_x_end = p_x - p_x_s, p_x1 - p_x_s
+
+    h_target = face_y_end - face_y_start
+    w_target = face_x_end - face_x_start
+    if face.shape[0] != h_target or face.shape[1] != w_target:
+        face = cv2.resize(face, (w_target, h_target))
+
+    face_large[face_y_start:face_y_end, face_x_start:face_x_end] = face
+
+    # Apply the mask blending in pure numpy
+    if mask_array.shape[:2] != face_large.shape[:2]:
+        mask_array = cv2.resize(mask_array, (face_large.shape[1], face_large.shape[0]))
+
+    if len(mask_array.shape) == 3:
+        # Convert to float and take mean of channels to preserve exact mask gradient
+        mask_float = mask_array.astype(np.float32).mean(axis=-1) / 255.0
+    else:
+        mask_float = mask_array.astype(np.float32) / 255.0
+
+    mask_float = mask_float[..., None]
+
+    original_crop = padded_img[p_y_s:p_y_e, p_x_s:p_x_e]
+    blended = (face_large * mask_float) + (original_crop * (1.0 - mask_float))
+
+    padded_img[p_y_s:p_y_e, p_x_s:p_x_e] = blended.astype(np.uint8)
+
+    result = padded_img[pad_t:pad_t+h_img, pad_l:pad_l+w_img]
+
+    return result
 
 
 def get_image_prepare_material(image, face_box, upper_boundary_ratio=0.5, expand=1.5, fp=None, mode="raw"):

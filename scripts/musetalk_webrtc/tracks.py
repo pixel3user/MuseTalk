@@ -30,6 +30,21 @@ class MuseTalkVideoTrack(VideoStreamTrack):
         self.frame_interval = 1.0 / self.fps
         self.stats = stats
 
+    async def next_timestamp(self) -> tuple[int, fractions.Fraction]:
+        """Override aiortc 30fps default to pace exactly to the requested engine FPS."""
+        if self.readyState != "live":
+            raise MediaStreamError
+
+        if hasattr(self, "_timestamp"):
+            self._timestamp += int((1.0 / self.fps) * 90000)
+            wait = self._start + (self._timestamp / 90000) - time.time()
+            await asyncio.sleep(max(0.0, wait))
+        else:
+            self._start = time.time()
+            self._timestamp = 0
+
+        return self._timestamp, fractions.Fraction(1, 90000)
+
     async def recv(self):
         """Produce the next `av.VideoFrame` for WebRTC sender.
 
