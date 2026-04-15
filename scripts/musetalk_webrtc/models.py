@@ -39,6 +39,7 @@ class AppArgs:
     use_fp16: bool
     require_mmpose: bool
     fps: int
+    avatar_fps: int
     batch_size: int
     bbox_shift: int
     unet_model_path: str

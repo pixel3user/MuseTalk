@@ -107,6 +107,23 @@ class Avatar:
                     input_mask_list = glob.glob(os.path.join(self.mask_out_path, '*.[jpJP][pnPN]*[gG]'))
                     input_mask_list = sorted(input_mask_list, key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
                     self.mask_list_cycle = read_imgs(input_mask_list)
+                
+                # fix duplicate frames from old bug
+                if len(self.frame_list_cycle) > 2 and len(self.frame_list_cycle) % 2 == 0:
+                    L = len(self.frame_list_cycle)
+                    mid = L // 2
+                    if np.array_equal(self.frame_list_cycle[mid - 1], self.frame_list_cycle[mid]) and                        np.array_equal(self.frame_list_cycle[0], self.frame_list_cycle[-1]):
+                        print(f"[{self.avatar_id}] Fixing duplicate frames in loaded avatar cache...")
+                        self.frame_list_cycle.pop(L - 1)
+                        self.frame_list_cycle.pop(mid)
+                        self.coord_list_cycle.pop(L - 1)
+                        self.coord_list_cycle.pop(mid)
+                        self.mask_list_cycle.pop(L - 1)
+                        self.mask_list_cycle.pop(mid)
+                        self.mask_coords_list_cycle.pop(L - 1)
+                        self.mask_coords_list_cycle.pop(mid)
+                        self.input_latent_list_cycle.pop(L - 1)
+                        self.input_latent_list_cycle.pop(mid)
                 else:
                     response = input(f"{self.avatar_id} exists, Do you want to re-create it ? (y/n)")
                     if response.lower() == "y":
@@ -128,6 +145,23 @@ class Avatar:
                         input_mask_list = glob.glob(os.path.join(self.mask_out_path, '*.[jpJP][pnPN]*[gG]'))
                         input_mask_list = sorted(input_mask_list, key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
                         self.mask_list_cycle = read_imgs(input_mask_list)
+                
+                # fix duplicate frames from old bug
+                if len(self.frame_list_cycle) > 2 and len(self.frame_list_cycle) % 2 == 0:
+                    L = len(self.frame_list_cycle)
+                    mid = L // 2
+                    if np.array_equal(self.frame_list_cycle[mid - 1], self.frame_list_cycle[mid]) and                        np.array_equal(self.frame_list_cycle[0], self.frame_list_cycle[-1]):
+                        print(f"[{self.avatar_id}] Fixing duplicate frames in loaded avatar cache...")
+                        self.frame_list_cycle.pop(L - 1)
+                        self.frame_list_cycle.pop(mid)
+                        self.coord_list_cycle.pop(L - 1)
+                        self.coord_list_cycle.pop(mid)
+                        self.mask_list_cycle.pop(L - 1)
+                        self.mask_list_cycle.pop(mid)
+                        self.mask_coords_list_cycle.pop(L - 1)
+                        self.mask_coords_list_cycle.pop(mid)
+                        self.input_latent_list_cycle.pop(L - 1)
+                        self.input_latent_list_cycle.pop(mid)
             else:
                 print("*********************************")
                 print(f"  creating avator: {self.avatar_id}")
@@ -173,6 +207,23 @@ class Avatar:
                 input_mask_list = glob.glob(os.path.join(self.mask_out_path, '*.[jpJP][pnPN]*[gG]'))
                 input_mask_list = sorted(input_mask_list, key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
                 self.mask_list_cycle = read_imgs(input_mask_list)
+                
+                # fix duplicate frames from old bug
+                if len(self.frame_list_cycle) > 2 and len(self.frame_list_cycle) % 2 == 0:
+                    L = len(self.frame_list_cycle)
+                    mid = L // 2
+                    if np.array_equal(self.frame_list_cycle[mid - 1], self.frame_list_cycle[mid]) and                        np.array_equal(self.frame_list_cycle[0], self.frame_list_cycle[-1]):
+                        print(f"[{self.avatar_id}] Fixing duplicate frames in loaded avatar cache...")
+                        self.frame_list_cycle.pop(L - 1)
+                        self.frame_list_cycle.pop(mid)
+                        self.coord_list_cycle.pop(L - 1)
+                        self.coord_list_cycle.pop(mid)
+                        self.mask_list_cycle.pop(L - 1)
+                        self.mask_list_cycle.pop(mid)
+                        self.mask_coords_list_cycle.pop(L - 1)
+                        self.mask_coords_list_cycle.pop(mid)
+                        self.input_latent_list_cycle.pop(L - 1)
+                        self.input_latent_list_cycle.pop(mid)
 
     def prepare_material(self):
         print("preparing data materials ... ...")
@@ -210,9 +261,9 @@ class Avatar:
             latents = vae.get_latents_for_unet(resized_crop_frame)
             input_latent_list.append(latents)
 
-        self.frame_list_cycle = frame_list + frame_list[::-1]
-        self.coord_list_cycle = coord_list + coord_list[::-1]
-        self.input_latent_list_cycle = input_latent_list + input_latent_list[::-1]
+        self.frame_list_cycle = frame_list + frame_list[-2:0:-1]
+        self.coord_list_cycle = coord_list + coord_list[-2:0:-1]
+        self.input_latent_list_cycle = input_latent_list + input_latent_list[-2:0:-1]
         self.mask_coords_list_cycle = []
         self.mask_list_cycle = []
 

@@ -40,7 +40,7 @@ class MuseTalkRealtimeEngine:
         self.video_buffer = video_buffer
         self.stop_event = asyncio.Event()
         self.last_total_samples = -1
-        self.avatar_frame_idx = 0
+        self.avatar_time_secs = 0.0
         self.jobs = 0
         self.dropped_audio_ms_total = 0.0
         self.last_publish_epoch = 0.0
@@ -48,6 +48,9 @@ class MuseTalkRealtimeEngine:
         self.prev_mouth_patch = None
         self._whisper_feature_cache = None
         self._cache_audio_samples = 0
+        self.vad_hangover = 0
+        self.silero_vad_model = None
+        self.silero_get_timestamps = None
 
         import scripts.realtime_inference as rt
 
@@ -148,6 +151,9 @@ class MuseTalkRealtimeEngine:
         rt.vae.vae.requires_grad_(False)
         rt.unet.model.requires_grad_(False)
 
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+
         rt.audio_processor = rt.AudioProcessor(feature_extractor_path=rt.args.whisper_dir)
         rt.weight_dtype = rt.unet.model.dtype
         rt.whisper = rt.WhisperModel.from_pretrained(rt.args.whisper_dir)
@@ -161,6 +167,17 @@ class MuseTalkRealtimeEngine:
             )
         else:
             rt.fp = rt.FaceParsing()
+
+        print("[engine] Loading Silero VAD...")
+        self.silero_vad_model, utils = torch.hub.load(
+            repo_or_dir="snakers4/silero-vad",
+            model="silero_vad",
+            force_reload=False,
+            trust_repo=True
+        )
+        self.silero_get_timestamps = utils[0]
+        self.silero_vad_model = self.silero_vad_model.to(rt.device)
+        self.silero_vad_model.eval()
 
     @torch.no_grad()
     def _append_whisper_cache(self, new_pcm16k: np.ndarray) -> None:
@@ -284,8 +301,35 @@ class MuseTalkRealtimeEngine:
 
         rt = self.rt
         combined_frames = []
-        gen = rt.datagen(whisper_chunks, self.avatar.input_latent_list_cycle, self.args.batch_size)
+
+        def my_datagen(whisper_chunks, vae_encode_latents, batch_size, start_time_secs, fps, avatar_fps):
+            whisper_batch, latent_batch = [], []
+            for i, w in enumerate(whisper_chunks):
+                t = start_time_secs + i / float(fps)
+                idx = int(t * avatar_fps) % len(vae_encode_latents)
+                latent_batch.append(vae_encode_latents[idx])
+                whisper_batch.append(w)
+                if len(latent_batch) >= batch_size:
+                    yield torch.stack(whisper_batch), torch.cat(latent_batch, dim=0)
+                    whisper_batch, latent_batch = [], []
+            if len(latent_batch) > 0:
+                yield torch.stack(whisper_batch), torch.cat(latent_batch, dim=0)
+
+        gen = my_datagen(
+            whisper_chunks,
+            self.avatar.input_latent_list_cycle,
+            self.args.batch_size,
+            self.avatar_time_secs,
+            self.args.fps,
+            self.args.avatar_fps
+        )
+
+        t0 = time.time()
+        model_time = 0.0
+        cv_time = 0.0
+
         for whisper_batch, latent_batch in gen:
+            t_model_start = time.time()
             audio_feature_batch = rt.pe(whisper_batch.to(rt.device))
             latent_batch = latent_batch.to(device=rt.device, dtype=rt.unet.model.dtype)
             pred_latents = rt.unet.model(
@@ -293,15 +337,21 @@ class MuseTalkRealtimeEngine:
             ).sample
             pred_latents = pred_latents.to(device=rt.device, dtype=rt.vae.vae.dtype)
             recon = rt.vae.decode_latents(pred_latents)
+            # Ensure GPU finishes before measuring
+            if rt.device.type == "cuda":
+                torch.cuda.synchronize()
+            model_time += time.time() - t_model_start
+
+            t_cv_start = time.time()
             for res_frame in recon:
-                base_i = self.avatar_frame_idx % len(self.avatar.frame_list_cycle)
+                base_i = int(self.avatar_time_secs * self.args.avatar_fps) % len(self.avatar.frame_list_cycle)
                 bbox = self.avatar.coord_list_cycle[base_i]
-                ori_frame = self.avatar.frame_list_cycle[base_i].copy()
+                ori_frame = self.avatar.frame_list_cycle[base_i]
                 x1, y1, x2, y2 = bbox
                 try:
-                    lip = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
+                    lip = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1), interpolation=cv2.INTER_LINEAR)
                 except Exception:
-                    self.avatar_frame_idx += 1
+                    self.avatar_time_secs += 1.0 / self.args.fps
                     continue
                 mask = self.avatar.mask_list_cycle[base_i]
                 mask_box = self.avatar.mask_coords_list_cycle[base_i]
@@ -319,7 +369,11 @@ class MuseTalkRealtimeEngine:
                         frame[y1c:y2c, x1c:x2c] = cur
                     self.prev_mouth_patch = frame[y1c:y2c, x1c:x2c].copy()
                 combined_frames.append(frame)
-                self.avatar_frame_idx += 1
+                self.avatar_time_secs += 1.0 / self.args.fps
+            cv_time += time.time() - t_cv_start
+
+        if self.args.debug and new_frames > 0:
+            print(f"[profiler] frames={new_frames} model={model_time*1000:.1f}ms cv={cv_time*1000:.1f}ms total={(time.time()-t0)*1000:.1f}ms")
 
         if not combined_frames:
             return []
@@ -340,25 +394,71 @@ class MuseTalkRealtimeEngine:
         window_samples = int((self.args.window_ms / 1000.0) * 16000)
         min_samples = int((self.args.min_window_ms / 1000.0) * 16000)
         max_advance_samples = int((self.args.max_advance_ms / 1000.0) * 16000)
-        hop_seconds = self.args.hop_ms / 1000.0
+
+        min_advance_samples = int((self.args.hop_ms / 1000.0) * 16000)
+
         while not self.stop_event.is_set():
-            await asyncio.sleep(max(0.02, hop_seconds))
             window, total = await self.pcm_ring.latest(window_samples)
             if window.size < min_samples:
-                continue
-            if total == self.last_total_samples:
+                await asyncio.sleep(0.02)
                 continue
 
             if self.last_total_samples < 0:
                 new_samples = int(window.size)
             else:
-                new_samples = max(1, int(total - self.last_total_samples))
+                new_samples = max(0, int(total - self.last_total_samples))
+
+            if new_samples > 0 and new_samples < min_advance_samples:
+                await asyncio.sleep(0.02)
+                continue
+
+            if new_samples == 0:
+                # Provide dummy silence when no audio arrives
+                silence_samples = min_advance_samples
+                self.last_total_samples += silence_samples
+                new_samples = silence_samples
+                
+                # Create a window of silence
+                silent_window = np.zeros((window_samples,), dtype=np.float32)
+                window = silent_window
+
             self.last_total_samples = total
 
             if max_advance_samples > 0 and new_samples > max_advance_samples:
                 dropped = (new_samples - max_advance_samples) * 1000.0 / 16000.0
                 self.dropped_audio_ms_total += dropped
                 new_samples = max_advance_samples
+
+            # --- VAD Filtering ---
+            # Extract the newest samples to check for voice
+            new_audio = window[-new_samples:]
+
+            # Use Silero VAD (highly accurate AI VAD that ignores non-speech noise)
+            # Silero requires at least 512 samples. If we have fewer, we pad with zeros.
+            min_samples_silero = 512
+            vad_audio = new_audio
+            if len(vad_audio) < min_samples_silero:
+                vad_audio = np.pad(vad_audio, (0, min_samples_silero - len(vad_audio)))
+
+            tensor_audio = torch.from_numpy(vad_audio).to(self.rt.device)
+            speech_timestamps = self.silero_get_timestamps(
+                tensor_audio,
+                self.silero_vad_model,
+                sampling_rate=16000,
+                min_speech_duration_ms=20, # Be very responsive to start
+                min_silence_duration_ms=10 # Fast cutoff
+            )
+
+            speech_detected = len(speech_timestamps) > 0
+
+            if speech_detected:
+                self.vad_hangover = 15  # Keep mouth open for ~300-450ms after speech stops to prevent flickering
+            else:
+                self.vad_hangover = max(0, self.vad_hangover - 1)
+
+            if self.vad_hangover == 0:
+                # No speech detected recently. Zero out the newest samples so the mouth closes.
+                window[-new_samples:] = 0.0
 
             # Fixes "same lips over and over" by publishing only newly advanced tail frames.
             new_frames = max(1, int(round((new_samples / 16000.0) * self.args.fps)))
@@ -374,6 +474,8 @@ class MuseTalkRealtimeEngine:
                 self.last_error = repr(e)
                 print(f"[engine] inference error: {e!r}")
 
+            await asyncio.sleep(0.005)
+
     def status(self) -> dict:
         """Return engine diagnostics used by `/status`.
 
@@ -388,6 +490,6 @@ class MuseTalkRealtimeEngine:
             "jobs": self.jobs,
             "last_publish_epoch": self.last_publish_epoch or None,
             "last_error": self.last_error or None,
-            "avatar_frame_idx": self.avatar_frame_idx,
+            "avatar_frame_idx": int(self.avatar_time_secs * self.args.fps),
             "dropped_audio_ms_total": round(self.dropped_audio_ms_total, 1),
         }

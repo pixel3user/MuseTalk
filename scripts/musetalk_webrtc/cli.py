@@ -54,6 +54,7 @@ def parse_args() -> AppArgs:
     parser.add_argument("--use-fp16", action="store_true")
     parser.add_argument("--require-mmpose", action="store_true")
     parser.add_argument("--fps", type=int, default=20)
+    parser.add_argument("--avatar-fps", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--bbox-shift", type=int, default=0)
     parser.add_argument("--unet-model-path", type=str, default="models/musetalkV15/unet.pth")
@@ -177,6 +178,7 @@ def parse_args() -> AppArgs:
         use_fp16=ns.use_fp16,
         require_mmpose=ns.require_mmpose,
         fps=ns.fps,
+        avatar_fps=ns.avatar_fps,
         batch_size=ns.batch_size,
         bbox_shift=ns.bbox_shift,
         unet_model_path=ns.unet_model_path,

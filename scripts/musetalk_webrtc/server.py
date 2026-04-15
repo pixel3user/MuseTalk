@@ -777,8 +777,13 @@ class WebRtcApp:
                 frame = await track.recv()
                 pcm = frame.to_ndarray()
                 pcm = np.asarray(pcm)
-                if pcm.ndim == 2:
-                    pcm = pcm.mean(axis=0)
+                channels = len(frame.layout.channels)
+                if channels > 1:
+                    if getattr(frame.format, "is_planar", False):
+                        pcm = pcm.mean(axis=0)
+                    else:
+                        pcm = pcm.reshape(-1, channels).mean(axis=1)
+
                 pcm = pcm.reshape(-1).astype(np.float32, copy=False)
                 fmt_name = str(getattr(getattr(frame, "format", None), "name", "")).lower()
                 if fmt_name.startswith(("s16", "s32", "u8")):

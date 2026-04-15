@@ -17,6 +17,9 @@ HTML_PAGE = """<!doctype html>
     <button id="stop" disabled>Stop</button>
     <span id="state" style="margin-left:8px">idle</span>
     <div id="mic" style="margin-top:8px;font-size:12px;color:#8fd48f">mic: idle</div>
+    <div style="margin-top:4px;height:10px;width:100%;max-width:300px;background:#333;border-radius:5px;overflow:hidden;">
+      <div id="mic-level" style="height:100%;width:0%;background:#4caf50;transition:width 0.1s;"></div>
+    </div>
     <div id="dbg" style="margin-top:8px;font-size:12px;white-space:pre-wrap;color:#b0b0b0"></div>
   </div>
 <script>
@@ -24,10 +27,14 @@ let pc = null;
 let localStream = null;
 let sessionId = null;
 let sessionToken = null;
+let audioContext = null;
+let analyser = null;
+
 const startBtn = document.getElementById('start');
 const stopBtn = document.getElementById('stop');
 const stateEl = document.getElementById('state');
 const micEl = document.getElementById('mic');
+const micLevelEl = document.getElementById('mic-level');
 
 // Update textual connection state in UI.
 function setState(next) {
@@ -58,6 +65,23 @@ async function waitIceGatheringComplete(pc, timeoutMs = 4000) {
   });
 }
 
+function updateMicLevel() {
+  if (!analyser) return;
+  const data = new Uint8Array(analyser.frequencyBinCount);
+  analyser.getByteTimeDomainData(data);
+  let sum = 0;
+  for (let i = 0; i < data.length; i++) {
+    const val = (data[i] - 128) / 128;
+    sum += val * val;
+  }
+  let rms = Math.sqrt(sum / data.length);
+  // Scale so normal talking is visible
+  let db = 20 * Math.log10(rms || 0.0001);
+  let pct = Math.max(0, Math.min(100, (db + 60) * (100/60)));
+  micLevelEl.style.width = pct + '%';
+  if (localStream) requestAnimationFrame(updateMicLevel);
+}
+
 // Close browser RTCPeerConnection and stop local media tracks.
 async function cleanupPeer() {
   if (pc) {
@@ -72,6 +96,12 @@ async function cleanupPeer() {
     }
     localStream = null;
   }
+  if (audioContext) {
+    audioContext.close();
+    audioContext = null;
+    analyser = null;
+  }
+  micLevelEl.style.width = '0%';
 }
 
 // Delete backend session (if created) using returned session token.
@@ -106,19 +136,38 @@ async function start() {
     setMic('requesting permission');
 
     const rtcCfg = await (await fetch('/config')).json();
+
+    // Enable browser audio processing enhancements
     localStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: true,
         noiseSuppression: true,
         autoGainControl: true,
+        channelCount: 1,
       },
       video: false,
     });
-    setMic('granted');
+    setMic('granted (processed audio)');
+
+    // IMPORTANT: When you route the microphone stream through the Web Audio API
+    // to mix in silence, the browser's native WebRTC stack automatically STRIPS
+    // the noiseSuppression and echoCancellation properties off the track.
+    // So we have to pass the pristine, unmixed microphone stream straight
+    // into the RTCPeerConnection so the WebRTC DSP processes it properly.
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+
+    // Setup Visualizer (just tapping the original stream, not replacing it)
+    const micSource = audioContext.createMediaStreamSource(localStream);
+    analyser = audioContext.createAnalyser();
+    analyser.fftSize = 2048;
+    micSource.connect(analyser);
+    requestAnimationFrame(updateMicLevel);
 
     pc = new RTCPeerConnection(rtcCfg);
     pc.addTransceiver('video', { direction: 'recvonly' });
     pc.addTransceiver('audio', { direction: 'recvonly' });
+
+    // Send the original mic stream directly to WebRTC so DSP works properly
     for (const track of localStream.getAudioTracks()) {
       pc.addTrack(track, localStream);
     }
@@ -186,16 +235,7 @@ setInterval(async () => {
 }, 1000);
 
 window.addEventListener('beforeunload', () => {
-  try {
-    if (localStream) {
-      for (const track of localStream.getTracks()) {
-        track.stop();
-      }
-    }
-    if (pc) {
-      pc.close();
-    }
-  } catch (e) {}
+  cleanupPeer();
 });
 </script>
 </body>
