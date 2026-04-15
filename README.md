@@ -138,6 +138,60 @@ https://github.com/user-attachments/assets/b011ece9-a332-4bc1-b8b7-ef6e383d7bde
 # Getting Started
 We provide a detailed tutorial about the installation and the basic usage of MuseTalk for new users:
 
+## WebRTC + PersonaPlex Quick Start (Single Session)
+
+This repo includes a WebRTC server flow where browser mic audio is sent to PersonaPlex (`/api/chat`) and MuseTalk returns generated video/audio to the same browser peer.
+
+### 1) Start server in cloud/container
+
+From the MuseTalk root:
+
+```bash
+cd /opt/MuseTalk
+PORT=8800 \
+PERSONAPLEX_HOST=127.0.0.1 \
+PERSONAPLEX_PORT=8998 \
+PERSONAPLEX_PATH=/api/chat \
+PERSONAPLEX_TEXT_PROMPT="You enjoy having a good conversation." \
+PERSONAPLEX_VOICE_PROMPT="myvoice.pt" \
+INPUT_SOURCE=mirror \
+ICE_SERVER="turn:127.0.0.1:3478?transport=tcp" \
+ICE_TRANSPORT_POLICY=relay \
+ICE_USERNAME="musetalk" \
+ICE_CREDENTIAL="Q2kezEEkJp2jrITreqDjnOWt" \
+DEBUG_WEBRTC=1 \
+./scripts/run_my_avatar_720_live_webrtc.sh
+```
+
+### 2) SSH local port forwarding from laptop
+
+Run this on your laptop (replace `<user>@<cloud-host>`):
+
+```bash
+ssh -N \
+  -L 8800:127.0.0.1:8800 \
+  -L 3478:127.0.0.1:3478 \
+  -L 5349:127.0.0.1:5349 \
+  <user>@<cloud-host>
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8800
+```
+
+### 3) Required PersonaPlex voice prompt file
+
+If `PERSONAPLEX_PATH=/api/chat`, PersonaPlex requires `voice_prompt` to exist in its voices directory.
+
+- Example expected file: `myvoice.pt`
+- Example env var: `PERSONAPLEX_VOICE_PROMPT="myvoice.pt"`
+- Typical voices directory inside container:  
+  `/root/.cache/huggingface/hub/models--nvidia--personaplex-7b-v1/snapshots/<snapshot-id>/voices/`
+
+If the file is missing, chat sessions connect but do not produce expected responses.
+
 ## Third party integration
 Thanks for the third-party integration, which makes installation and use more convenient for everyone.
 We also hope you note that we have not verified, maintained, or updated third-party. Please refer to this project for specific results.
@@ -171,6 +225,34 @@ Install the remaining required packages:
 
 ```shell
 pip install -r requirements.txt
+```
+
+### Linux System Packages for OpenCV (WebRTC/Server)
+If you run MuseTalk on a Linux server/container, OpenCV may fail with:
+`ImportError: libGL.so.1: cannot open shared object file`.
+
+Install these system libraries:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y libgl1 libglib2.0-0
+```
+
+If your distro/image still reports OpenCV GUI loader errors, also install:
+
+```bash
+sudo apt-get install -y libsm6 libxext6 libxrender1
+```
+
+#### Headless vs non-headless OpenCV
+- **Server/headless deployment (recommended):** use `opencv-python-headless` to reduce GUI/libGL issues.
+- **Desktop/local visualization:** keep `opencv-python` and install the Linux system packages above.
+
+To switch an existing environment to headless OpenCV:
+
+```bash
+pip uninstall -y opencv-python
+pip install opencv-python-headless==4.9.0.80
 ```
 
 ### Install MMLab Packages
