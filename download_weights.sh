@@ -96,7 +96,7 @@ if [ "$RESULTS_RESTORE" = "1" ]; then
   curl -L "$RESULTS_ARCHIVE_URL" -o "$tmp_archive"
 
   echo "Extracting archive to: $RESULTS_EXTRACT_DIR"
-  tar -xf "$tmp_archive" -C "$RESULTS_EXTRACT_DIR"
+  tar -xf "$tmp_archive" -C "$RESULTS_EXTRACT_DIR" --strip-components=3
   rm -f "$tmp_archive"
 
   if [ ! -f "$RESULTS_EXTRACT_DIR/$RESULTS_AVATAR_ID/avator_info.json" ]; then
