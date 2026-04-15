@@ -1,42 +1,39 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Upload MuseTalk results directory to object storage.
+# Upload MuseTalk results directory to object storage and update download script.
 # Supports:
-# 1) Tar mode (default): create one .tar archive and upload it
+# 1) Tar mode (default): create one .tar.gz archive and upload it
 # 2) Sync mode: upload all files directly (slower for many small files)
 #
 # Examples:
-#   ./upload_results.sh jaat:MuseTalk/archives --source results/v15/avatars/my_avatar_720_live
-#   ./upload_results.sh s3://my-bucket/musetalk/archives --source results/v15/avatars/my_avatar_720_live
-#   ./upload_results.sh jaat:MuseTalk/results --mode sync --source results/v15/avatars/my_avatar_720_live
+#   ./upload_results.sh gs://my-firebase-bucket/results --source results/my_run
 #
-# Optional env for S3-compatible endpoints:
-#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION, AWS_ENDPOINT_URL
+# Before running for the first time, ensure you are authenticated with the correct account:
+#   gcloud auth login
+#   gcloud config set account YOUR_EMAIL@gmail.com
 
 SOURCE_DIR="results"
 DEST=""
 MODE="tar"
 ARCHIVE_NAME=""
+DOWNLOAD_SCRIPT="download_weights.sh"
 
 usage() {
   cat <<EOF
 Usage:
-  $(basename "$0") <destination> [--source <dir>] [--mode tar|sync] [--archive-name <name.tar>]
+  $(basename "$0") <destination> [--source <dir>] [--mode tar|sync] [--archive-name <name.tar.gz>]
 
 Arguments:
-  destination         Target directory:
-                      - s3://bucket/path
-                      - remote:path
+  destination         Target directory, MUST be a Firebase/Google Cloud Storage path:
+                      - gs://bucket/path
   --source <dir>      Source directory to upload (default: results)
   --mode <mode>       Upload mode: tar (default) or sync
-  --archive-name      Archive file name in tar mode (default: <source_basename>.tar)
+  --archive-name      Archive file name in tar mode (default: <source_basename>_YYYYMMDD_HHMMSS.tar.gz)
   -h, --help          Show this help
 
 Examples:
-  $(basename "$0") jaat:MuseTalk/archives --source results/v15/avatars/my_avatar_720_live
-  $(basename "$0") s3://my-bucket/musetalk/archives --source results/v15/avatars/my_avatar_720_live
-  $(basename "$0") jaat:MuseTalk/results --mode sync --source results/v15/avatars/my_avatar_720_live
+  $(basename "$0") gs://my-firebase-bucket/results --source results/my_run
 EOF
 }
 
@@ -82,6 +79,11 @@ if [[ -z "$DEST" ]]; then
   exit 1
 fi
 
+if [[ "$DEST" != gs://* ]]; then
+    echo "Destination must be a gs:// path for Firebase/Google Cloud Storage." >&2
+    exit 1
+fi
+
 if [[ "$MODE" != "tar" && "$MODE" != "sync" ]]; then
   echo "Invalid mode: $MODE (use tar or sync)" >&2
   exit 1
@@ -92,73 +94,67 @@ if [[ ! -d "$SOURCE_DIR" ]]; then
   exit 1
 fi
 
+if ! command -v gcloud >/dev/null 2>&1; then
+    echo "gcloud CLI not found. Install and configure it first: https://cloud.google.com/sdk/docs/install" >&2
+    exit 1
+fi
+
 echo "Source: $SOURCE_DIR"
 echo "Destination: $DEST"
 echo "Mode: $MODE"
 
-upload_with_aws() {
-  local src="$1"
-  local dst="$2"
-  if [[ -n "${AWS_ENDPOINT_URL:-}" ]]; then
-    aws s3 cp "$src" "$dst" --endpoint-url "$AWS_ENDPOINT_URL" --no-progress
-  else
-    aws s3 cp "$src" "$dst" --no-progress
-  fi
-}
-
 if [[ "$MODE" == "sync" ]]; then
-  if [[ "$DEST" == s3://* ]]; then
-    if ! command -v aws >/dev/null 2>&1; then
-      echo "aws cli not found. Install it first: pip install awscli" >&2
-      exit 1
-    fi
-
-    if [[ -n "${AWS_ENDPOINT_URL:-}" ]]; then
-      aws s3 sync "$SOURCE_DIR" "$DEST" --endpoint-url "$AWS_ENDPOINT_URL" --no-progress
-    else
-      aws s3 sync "$SOURCE_DIR" "$DEST" --no-progress
-    fi
-  else
-    if ! command -v rclone >/dev/null 2>&1; then
-      echo "rclone not found. Install and configure a remote first: https://rclone.org/" >&2
-      exit 1
-    fi
-    rclone sync "$SOURCE_DIR" "$DEST" --progress
-  fi
+  gcloud storage rsync "$SOURCE_DIR" "$DEST"
+  echo "Sync complete. Note: Public URL generation is only supported for 'tar' mode."
 else
+  # TAR MODE
   src_abs="$(cd "$(dirname "$SOURCE_DIR")" && pwd)/$(basename "$SOURCE_DIR")"
   src_base="$(basename "$SOURCE_DIR")"
   if [[ -z "$ARCHIVE_NAME" ]]; then
-    ARCHIVE_NAME="${src_base}.tar"
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    ARCHIVE_NAME="${src_base}_${timestamp}.tar.gz"
   fi
   case "$ARCHIVE_NAME" in
-    *.tar) ;;
-    *) ARCHIVE_NAME="${ARCHIVE_NAME}.tar" ;;
+    *.tar.gz) ;;
+    *) ARCHIVE_NAME="${ARCHIVE_NAME}.tar.gz" ;;
   esac
 
-  tmp_archive="$(mktemp "/tmp/${src_base}.XXXXXX.tar")"
-  tar -cf "$tmp_archive" -C "$(dirname "$src_abs")" "$src_base"
-  target="${DEST%/}/${ARCHIVE_NAME}"
-  echo "Archive: $tmp_archive"
-  echo "Target: $target"
+  tmp_archive="$(mktemp "/tmp/${src_base}.XXXXXX.tar.gz")"
+  echo "Creating archive: $tmp_archive"
+  tar -czf "$tmp_archive" -C "$(dirname "$src_abs")" "$src_base"
 
-  if [[ "$DEST" == s3://* ]]; then
-    if ! command -v aws >/dev/null 2>&1; then
-      echo "aws cli not found. Install it first: pip install awscli" >&2
-      rm -f "$tmp_archive"
-      exit 1
-    fi
-    upload_with_aws "$tmp_archive" "$target"
+  target_path="${DEST%/}/${ARCHIVE_NAME}"
+  echo "Uploading to: $target_path"
+
+  gcloud storage cp "$tmp_archive" "$target_path"
+
+  echo "Setting public read access..."
+  gcloud storage objects update "$target_path" --add-acl-grant=entity=AllUsers,role=READER
+
+  bucket_name=$(echo "$DEST" | sed -e 's,gs://,,' -e 's,/.*$,,')
+  object_path=$(echo "$target_path" | sed -e "s,gs://${bucket_name}/,,")
+
+  # URL encode the object path
+  encoded_object_path=$(python3 -c "import urllib.parse; print(urllib.parse.quote('''$object_path''', safe=''))")
+
+  download_url="https://firebasestorage.googleapis.com/v0/b/${bucket_name}/o/${encoded_object_path}?alt=media"
+
+  echo "========================================================================"
+  echo "Upload complete! Download URL:"
+  echo "$download_url"
+  echo "========================================================================"
+
+  if [[ -f "$DOWNLOAD_SCRIPT" ]]; then
+    echo "Updating ${DOWNLOAD_SCRIPT} with new URL..."
+    # Use a different delimiter for sed since the URL contains slashes
+    sed -i.bak "s|^RESULTS_ARCHIVE_URL=.*|RESULTS_ARCHIVE_URL=\"\${RESULTS_ARCHIVE_URL:-${download_url}}\"|" "$DOWNLOAD_SCRIPT"
+    echo "${DOWNLOAD_SCRIPT} has been updated."
+    rm -f "${DOWNLOAD_SCRIPT}.bak"
   else
-    if ! command -v rclone >/dev/null 2>&1; then
-      echo "rclone not found. Install and configure a remote first: https://rclone.org/" >&2
-      rm -f "$tmp_archive"
-      exit 1
-    fi
-    rclone copyto "$tmp_archive" "$target" --progress
+    echo "Warning: ${DOWNLOAD_SCRIPT} not found, could not update URL."
   fi
 
   rm -f "$tmp_archive"
 fi
 
-echo "Upload complete."
+echo "Script finished."

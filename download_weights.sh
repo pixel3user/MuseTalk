@@ -8,7 +8,7 @@ CheckpointsDir="models"
 # Optional prepared-avatar restore (enabled by default).
 # Set RESULTS_RESTORE=0 to skip.
 RESULTS_RESTORE="${RESULTS_RESTORE:-1}"
-RESULTS_ARCHIVE_URL="${RESULTS_ARCHIVE_URL:-https://firebasestorage.googleapis.com/v0/b/farm2market-99.firebasestorage.app/o/my_avatar_720_live.tar?alt=media&token=bd59a3ca-787c-40f6-a064-a9619b707b4c}"
+RESULTS_ARCHIVE_URL="${RESULTS_ARCHIVE_URL:-https://firebasestorage.googleapis.com/v0/b/farm2market-99.firebasestorage.app/o/results%2Fresults_20260415_114349.tar.gz?alt=media}"
 RESULTS_EXTRACT_DIR="${RESULTS_EXTRACT_DIR:-results/v15/avatars}"
 RESULTS_AVATAR_ID="${RESULTS_AVATAR_ID:-my_avatar_720_live}"
 
