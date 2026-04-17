@@ -2,13 +2,32 @@
 
 set -euo pipefail
 
+# Function to retry a command up to 3 times with a 5-second delay
+retry() {
+    local retries=3
+    local count=0
+    until "$@"; do
+        exit=$?
+        count=$(($count + 1))
+        if [ $count -lt $retries ]; then
+            echo "Command failed. Attempt $count/$retries. Retrying in 5 seconds..."
+            sleep 5
+        else
+            echo "Command failed after $retries attempts. Giving up."
+            return $exit
+        fi
+    done
+    return 0
+}
+
+
 # Set the checkpoints directory
 CheckpointsDir="models"
 
 # Optional prepared-avatar restore (enabled by default).
 # Set RESULTS_RESTORE=0 to skip.
 RESULTS_RESTORE="${RESULTS_RESTORE:-1}"
-RESULTS_ARCHIVE_URL="${RESULTS_ARCHIVE_URL:-https://firebasestorage.googleapis.com/v0/b/farm2market-99.firebasestorage.app/o/results%2Fresults_20260415_114349.tar.gz?alt=media}"
+RESULTS_ARCHIVE_URL="${RESULTS_ARCHIVE_URL:-https://firebasestorage.googleapis.com/v0/b/farm2market-99.firebasestorage.app/o/results%2Fresults_20240415_114349.tar.gz?alt=media}"
 RESULTS_EXTRACT_DIR="${RESULTS_EXTRACT_DIR:-results/v15/avatars}"
 RESULTS_AVATAR_ID="${RESULTS_AVATAR_ID:-my_avatar_720_live}"
 
@@ -23,28 +42,28 @@ pip install gdown
 export HF_ENDPOINT=https://hf-mirror.com
 
 # Download MuseTalk V1.0 weights
-hf download TMElyralab/MuseTalk \
+retry hf download TMElyralab/MuseTalk \
   --local-dir $CheckpointsDir \
   --repo-type model \
   --include "musetalk/musetalk.json" \
   --include "musetalk/pytorch_model.bin"
 
 # Download MuseTalk V1.5 weights (unet.pth)
-hf download TMElyralab/MuseTalk \
+retry hf download TMElyralab/MuseTalk \
   --local-dir $CheckpointsDir \
   --repo-type model \
   --include "musetalkV15/musetalk.json" \
   --include "musetalkV15/unet.pth"
 
 # Download SD VAE weights
-hf download stabilityai/sd-vae-ft-mse \
+retry hf download stabilityai/sd-vae-ft-mse \
   --local-dir $CheckpointsDir/sd-vae \
   --repo-type model \
   --include "config.json" \
   --include "diffusion_pytorch_model.bin"
 
 # Download Whisper weights
-hf download openai/whisper-tiny \
+retry hf download openai/whisper-tiny \
   --local-dir $CheckpointsDir/whisper \
   --repo-type model \
   --include "config.json" \
@@ -52,21 +71,24 @@ hf download openai/whisper-tiny \
   --include "preprocessor_config.json"
 
 # Download DWPose weights
-hf download yzd-v/DWPose \
+retry hf download yzd-v/DWPose \
   --local-dir $CheckpointsDir/dwpose \
   --repo-type model \
   --include "dw-ll_ucoco_384.pth"
 
 # Download SyncNet weights
-hf download ByteDance/LatentSync \
+retry hf download ByteDance/LatentSync \
   --local-dir $CheckpointsDir/syncnet \
   --repo-type model \
   --include "latentsync_syncnet.pt"
 
 # Download Face Parse Bisent weights
-gdown https://drive.google.com/uc?id=154JgKpzCPW82qINcVieuPH3fZ2e0P812 -O $CheckpointsDir/face-parse-bisent/79999_iter.pth
-curl -L https://download.pytorch.org/models/resnet18-5c106cde.pth \
+retry gdown https://drive.google.com/uc?id=154JgKpzCPW82qINcVieuPH3fZ2e0P812 -O $CheckpointsDir/face-parse-bisent/79999_iter.pth
+retry curl -L https://download.pytorch.org/models/resnet18-5c106cde.pth \
   -o $CheckpointsDir/face-parse-bisent/resnet18-5c106cde.pth
+
+# Wait for all potential background download processes to complete before checking
+wait
 
 required_files=(
   "$CheckpointsDir/musetalk/musetalk.json"
@@ -93,7 +115,7 @@ if [ "$RESULTS_RESTORE" = "1" ]; then
   tmp_archive="$(mktemp /tmp/${RESULTS_AVATAR_ID}.XXXXXX.tar)"
 
   echo "Downloading prepared avatar archive for '${RESULTS_AVATAR_ID}'..."
-  curl -L "$RESULTS_ARCHIVE_URL" -o "$tmp_archive"
+  retry curl -L "$RESULTS_ARCHIVE_URL" -o "$tmp_archive"
 
   echo "Extracting archive to: $RESULTS_EXTRACT_DIR"
   tar -xf "$tmp_archive" -C "$RESULTS_EXTRACT_DIR" --strip-components=3
@@ -108,3 +130,4 @@ if [ "$RESULTS_RESTORE" = "1" ]; then
 else
   echo "Skipping prepared avatar restore (RESULTS_RESTORE=0)."
 fi
+
