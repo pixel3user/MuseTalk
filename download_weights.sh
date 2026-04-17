@@ -41,51 +41,32 @@ pip install gdown
 # Set HuggingFace mirror endpoint
 export HF_ENDPOINT=https://hf-mirror.com
 
-# Download MuseTalk V1.0 weights
-retry hf download TMElyralab/MuseTalk \
-  --local-dir $CheckpointsDir \
-  --repo-type model \
-  --include "musetalk/musetalk.json" \
-  --include "musetalk/pytorch_model.bin"
+echo "Downloading MuseTalk V1.0 weights..."
+retry hf download TMElyralab/MuseTalk --local-dir "$CheckpointsDir" --repo-type model --include "musetalk/musetalk.json"
+retry hf download TMElyralab/MuseTalk --local-dir "$CheckpointsDir" --repo-type model --include "musetalk/pytorch_model.bin"
 
-# Download MuseTalk V1.5 weights (unet.pth)
-retry hf download TMElyralab/MuseTalk \
-  --local-dir $CheckpointsDir \
-  --repo-type model \
-  --include "musetalkV15/musetalk.json" \
-  --include "musetalkV15/unet.pth"
+echo "Downloading MuseTalk V1.5 weights..."
+retry hf download TMElyralab/MuseTalk --local-dir "$CheckpointsDir" --repo-type model --include "musetalkV15/musetalk.json"
+retry hf download TMElyralab/MuseTalk --local-dir "$CheckpointsDir" --repo-type model --include "musetalkV15/unet.pth"
 
-# Download SD VAE weights
-retry hf download stabilityai/sd-vae-ft-mse \
-  --local-dir $CheckpointsDir/sd-vae \
-  --repo-type model \
-  --include "config.json" \
-  --include "diffusion_pytorch_model.bin"
+echo "Downloading SD VAE weights..."
+retry hf download stabilityai/sd-vae-ft-mse --local-dir "$CheckpointsDir/sd-vae" --repo-type model --include "config.json"
+retry hf download stabilityai/sd-vae-ft-mse --local-dir "$CheckpointsDir/sd-vae" --repo-type model --include "diffusion_pytorch_model.bin"
 
-# Download Whisper weights
-retry hf download openai/whisper-tiny \
-  --local-dir $CheckpointsDir/whisper \
-  --repo-type model \
-  --include "config.json" \
-  --include "pytorch_model.bin" \
-  --include "preprocessor_config.json"
+echo "Downloading Whisper weights..."
+retry hf download openai/whisper-tiny --local-dir "$CheckpointsDir/whisper" --repo-type model --include "config.json"
+retry hf download openai/whisper-tiny --local-dir "$CheckpointsDir/whisper" --repo-type model --include "pytorch_model.bin"
+retry hf download openai/whisper-tiny --local-dir "$CheckpointsDir/whisper" --repo-type model --include "preprocessor_config.json"
 
-# Download DWPose weights
-retry hf download yzd-v/DWPose \
-  --local-dir $CheckpointsDir/dwpose \
-  --repo-type model \
-  --include "dw-ll_ucoco_384.pth"
+echo "Downloading DWPose weights..."
+retry hf download yzd-v/DWPose --local-dir "$CheckpointsDir/dwpose" --repo-type model --include "dw-ll_ucoco_384.pth"
 
-# Download SyncNet weights
-retry hf download ByteDance/LatentSync \
-  --local-dir $CheckpointsDir/syncnet \
-  --repo-type model \
-  --include "latentsync_syncnet.pt"
+echo "Downloading SyncNet weights..."
+retry hf download ByteDance/LatentSync --local-dir "$CheckpointsDir/syncnet" --repo-type model --include "latentsync_syncnet.pt"
 
-# Download Face Parse Bisent weights
-retry gdown https://drive.google.com/uc?id=154JgKpzCPW82qINcVieuPH3fZ2e0P812 -O $CheckpointsDir/face-parse-bisent/79999_iter.pth
-retry curl -L https://download.pytorch.org/models/resnet18-5c106cde.pth \
-  -o $CheckpointsDir/face-parse-bisent/resnet18-5c106cde.pth
+echo "Downloading Face Parse Bisent weights..."
+retry gdown https://drive.google.com/uc?id=154JgKpzCPW82qINcVieuPH3fZ2e0P812 -O "$CheckpointsDir/face-parse-bisent/79999_iter.pth"
+retry curl -L https://download.pytorch.org/models/resnet18-5c106cde.pth -o "$CheckpointsDir/face-parse-bisent/resnet18-5c106cde.pth"
 
 # Wait for all potential background download processes to complete before checking
 wait
@@ -130,4 +111,3 @@ if [ "$RESULTS_RESTORE" = "1" ]; then
 else
   echo "Skipping prepared avatar restore (RESULTS_RESTORE=0)."
 fi
-
