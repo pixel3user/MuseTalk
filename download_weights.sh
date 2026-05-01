@@ -27,7 +27,9 @@ CheckpointsDir="models"
 # Optional prepared-avatar restore (enabled by default).
 # Set RESULTS_RESTORE=0 to skip.
 RESULTS_RESTORE="${RESULTS_RESTORE:-1}"
-RESULTS_ARCHIVE_URL="${RESULTS_ARCHIVE_URL:-https://firebasestorage.googleapis.com/v0/b/farm2market-99.firebasestorage.app/o/results%2Fresults_20260415_114349.tar.gz?alt=media}"
+# RESULTS_ARCHIVE_URL="${RESULTS_ARCHIVE_URL:-https://firebasestorage.googleapis.com/v0/b/farm2market-99.firebasestorage.app/o/results%2Fresults_20260415_114349.tar.gz?alt=media}"
+RESULTS_HF_REPO="${RESULTS_HF_REPO:-ColdSlim/results}"
+RESULTS_HF_FILE="${RESULTS_HF_FILE:-results.tar.gz}"
 RESULTS_EXTRACT_DIR="${RESULTS_EXTRACT_DIR:-results/v15/avatars}"
 RESULTS_AVATAR_ID="${RESULTS_AVATAR_ID:-my_avatar_720_live}"
 
@@ -93,10 +95,21 @@ echo "All weights have been downloaded successfully."
 
 if [ "$RESULTS_RESTORE" = "1" ]; then
   mkdir -p "$RESULTS_EXTRACT_DIR"
-  tmp_archive="$(mktemp /tmp/${RESULTS_AVATAR_ID}.XXXXXX.tar)"
+  tmp_archive="$(mktemp /tmp/${RESULTS_AVATAR_ID}.XXXXXX.tar.gz)"
 
-  echo "Downloading prepared avatar archive for '${RESULTS_AVATAR_ID}'..."
-  retry curl -L "$RESULTS_ARCHIVE_URL" -o "$tmp_archive"
+  echo "Downloading prepared avatar archive from HF: ${RESULTS_HF_REPO}/${RESULTS_HF_FILE}..."
+  
+  # Use curl with the token for the most reliable download of private files
+  # This works even if the hf CLI isn't logged in within the container
+  token_header=""
+  if [ -n "${HF_TOKEN:-}" ]; then
+      token_header="Authorization: Bearer ${HF_TOKEN}"
+      echo "  (Using HF_TOKEN for authentication)"
+  fi
+
+  retry curl -L -H "$token_header" \
+    "https://huggingface.co/${RESULTS_HF_REPO}/resolve/main/${RESULTS_HF_FILE}" \
+    -o "$tmp_archive"
 
   echo "Extracting archive to: $RESULTS_EXTRACT_DIR"
   tar -xf "$tmp_archive" -C "$RESULTS_EXTRACT_DIR" --strip-components=3
