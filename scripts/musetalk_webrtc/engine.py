@@ -135,10 +135,26 @@ class MuseTalkRealtimeEngine:
         rt.timesteps = torch.tensor([0], device=rt.device)
 
         if rt.device.type == "cuda" and rt.args.use_fp16:
-            rt.pe = rt.pe.half().to(rt.device)
-            rt.vae.vae = rt.vae.vae.half().to(rt.device)
-            rt.unet.model = rt.unet.model.half().to(rt.device)
-            print("[engine] precision: fp16")
+            # Optimal precision choice for Ada/Blackwell GPUs
+            if torch.cuda.is_bf16_supported():
+                target_dtype = torch.bfloat16
+                precision_name = "bf16"
+            else:
+                target_dtype = torch.float16
+                precision_name = "fp16"
+            
+            rt.pe = rt.pe.to(device=rt.device, dtype=target_dtype)
+            rt.vae.vae = rt.vae.vae.to(device=rt.device, dtype=target_dtype)
+            rt.unet.model = rt.unet.model.to(device=rt.device, dtype=target_dtype)
+            
+            # Enable hardware-accelerated Flash Attention if available
+            try:
+                rt.unet.model.enable_xformers_memory_efficient_attention()
+            except Exception:
+                # Fallback to PyTorch native SDPA which is also very fast
+                pass
+                
+            print(f"[engine] precision: {precision_name} (with attention optimization)")
         else:
             rt.pe = rt.pe.float().to(rt.device)
             rt.vae.vae = rt.vae.vae.float().to(rt.device)
@@ -398,29 +414,23 @@ class MuseTalkRealtimeEngine:
         min_advance_samples = int((self.args.hop_ms / 1000.0) * 16000)
 
         while not self.stop_event.is_set():
+            # Event-driven wait for new audio data
             window, total = await self.pcm_ring.latest(window_samples)
-            if window.size < min_samples:
-                await asyncio.sleep(0.02)
-                continue
-
+            
             if self.last_total_samples < 0:
                 new_samples = int(window.size)
             else:
                 new_samples = max(0, int(total - self.last_total_samples))
 
-            if new_samples > 0 and new_samples < min_advance_samples:
-                await asyncio.sleep(0.02)
+            # If no new samples or not enough for a hop, wait for the event
+            if new_samples < min_advance_samples:
+                try:
+                    # Wait for up to 100ms for new data
+                    await asyncio.wait_for(self.pcm_ring.new_data_event.wait(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    pass
+                self.pcm_ring.new_data_event.clear()
                 continue
-
-            if new_samples == 0:
-                # Provide dummy silence when no audio arrives
-                silence_samples = min_advance_samples
-                self.last_total_samples += silence_samples
-                new_samples = silence_samples
-                
-                # Create a window of silence
-                silent_window = np.zeros((window_samples,), dtype=np.float32)
-                window = silent_window
 
             self.last_total_samples = total
 
@@ -433,8 +443,7 @@ class MuseTalkRealtimeEngine:
             # Extract the newest samples to check for voice
             new_audio = window[-new_samples:]
 
-            # Use Silero VAD (highly accurate AI VAD that ignores non-speech noise)
-            # Silero requires at least 512 samples. If we have fewer, we pad with zeros.
+            # Use Silero VAD
             min_samples_silero = 512
             vad_audio = new_audio
             if len(vad_audio) < min_samples_silero:
@@ -445,20 +454,23 @@ class MuseTalkRealtimeEngine:
                 tensor_audio,
                 self.silero_vad_model,
                 sampling_rate=16000,
-                min_speech_duration_ms=20, # Be very responsive to start
-                min_silence_duration_ms=10 # Fast cutoff
+                min_speech_duration_ms=20,
+                min_silence_duration_ms=10
             )
 
             speech_detected = len(speech_timestamps) > 0
 
             if speech_detected:
-                self.vad_hangover = 15  # Keep mouth open for ~300-450ms after speech stops to prevent flickering
+                self.vad_hangover = 15
             else:
                 self.vad_hangover = max(0, self.vad_hangover - 1)
 
             if self.vad_hangover == 0:
-                # No speech detected recently. Zero out the newest samples so the mouth closes.
+                # No speech detected recently. Zero out the newest samples.
                 window[-new_samples:] = 0.0
+                # Flush the whisper cache to prevent mouth "stuttering" on old speech features
+                self._whisper_feature_cache = None
+                self._cache_audio_samples = 0
 
             # Fixes "same lips over and over" by publishing only newly advanced tail frames.
             new_frames = max(1, int(round((new_samples / 16000.0) * self.args.fps)))

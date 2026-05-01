@@ -23,6 +23,7 @@ class PcmRingBuffer:
         self.buf = np.zeros((0,), dtype=np.float32)
         self.total_samples = 0
         self.lock = asyncio.Lock()
+        self.new_data_event = asyncio.Event()
 
     async def append(self, samples: np.ndarray) -> None:
         """Append float PCM samples and clip to ring capacity.
@@ -41,6 +42,7 @@ class PcmRingBuffer:
             self.buf = np.concatenate([self.buf, samples.astype(np.float32, copy=False)])
             if self.buf.size > self.max_samples:
                 self.buf = self.buf[-self.max_samples :]
+            self.new_data_event.set()
 
     async def latest(self, n_samples: int) -> tuple[np.ndarray, int]:
         """Return the newest window and cumulative sample counter.
