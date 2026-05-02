@@ -280,7 +280,10 @@ class PersonaPlexChatBridge:
             self.writer.append_pcm(pcm24k)
             pages = self.writer.read_bytes()
             if pages:
-                await ws.send_bytes(b"\x01" + pages)
+                try:
+                    await ws.send_bytes(b"\x01" + pages)
+                except (aiohttp.ClientConnectionError, ConnectionResetError):
+                    return
                 self.tx_packets += 1
                 if self.debug_log is not None and self.tx_packets in {1, 10}:
                     self.debug_log(
@@ -336,7 +339,9 @@ class PersonaPlexChatBridge:
                             session_id=self.session.session_id,
                             error=self.last_error,
                         )
-                    if not self.stop_event.is_set():
+                    if not self.stop_event.is_set() and not isinstance(
+                        e, (aiohttp.ClientConnectionError, ConnectionResetError)
+                    ):
                         print(f"[personaplex-chat] bridge error: {e!r}")
                 if not self.stop_event.is_set():
                     await asyncio.sleep(max(0.2, self.reconnect_delay_seconds))
