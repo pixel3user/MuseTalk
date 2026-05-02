@@ -15,6 +15,18 @@ from einops import rearrange
 from .buffers import PcmRingBuffer, VideoFrameBuffer
 from .models import AppArgs
 
+async def _frame_gap_watchdog(video_buffer, fps, stats):
+    """Logs when no frame has been published for more than 2 frame intervals."""
+    frame_interval = 1.0 / fps
+    threshold = frame_interval * 2  # 80ms at 25fps
+    while True:
+        await asyncio.sleep(frame_interval)
+        last = stats.get("last_video_send_epoch", 0)
+        gap = time.time() - last
+        if last > 0 and gap > threshold:
+            q = video_buffer.queue.qsize()
+            print(f"[WATCHDOG] *** NO FRAME FOR {gap*1000:.0f}ms *** queue={q}")
+
 class MuseTalkRealtimeEngine:
     """Audio-driven MuseTalk inference engine that publishes avatar frames."""
 
@@ -51,6 +63,12 @@ class MuseTalkRealtimeEngine:
         self.vad_hangover = 0
         self.silero_vad_model = None
         self.silero_get_timestamps = None
+        
+        # Performance Tracking (Claude Recommendation)
+        self._infer_ms_ema = 320.0 # Initial estimate to match observed latency
+        self.stats = {
+            "last_video_send_epoch": 0.0
+        }
 
         import scripts.realtime_inference as rt
 
@@ -312,6 +330,15 @@ class MuseTalkRealtimeEngine:
         tail_n = max(1, min(int(advance_samples), int(pcm16k_window.size)))
         self._append_whisper_cache(pcm16k_window[-tail_n:])
         whisper_chunks = self._tail_whisper_chunks(new_frames)
+        
+        # If cache doesn't have enough chunks, re-encode the full window (Claude Recommendation)
+        if whisper_chunks is None or len(whisper_chunks) < new_frames:
+            self._whisper_feature_cache = None
+            self._cache_audio_samples = 0
+            # Feed the full window (e.g. 640ms) to ensure enough chunks exist for the batch
+            self._append_whisper_cache(pcm16k_window)
+            whisper_chunks = self._tail_whisper_chunks(new_frames)
+
         if whisper_chunks is None or len(whisper_chunks) == 0:
             return []
 
@@ -407,6 +434,9 @@ class MuseTalkRealtimeEngine:
         - `None` (runs until `stop_event` is set).
         """
 
+        # Start watchdog within the active event loop (Claude Recommendation)
+        asyncio.create_task(_frame_gap_watchdog(self.video_buffer, self.args.fps, self.stats))
+
         window_samples = int((self.args.window_ms / 1000.0) * 16000)
         min_samples = int((self.args.min_window_ms / 1000.0) * 16000)
         max_advance_samples = int((self.args.max_advance_ms / 1000.0) * 16000)
@@ -415,6 +445,7 @@ class MuseTalkRealtimeEngine:
 
         while not self.stop_event.is_set():
             # Event-driven wait for new audio data
+            _loop_start = time.perf_counter()
             window, total = await self.pcm_ring.latest(window_samples)
             
             if self.last_total_samples < 0:
@@ -439,24 +470,29 @@ class MuseTalkRealtimeEngine:
                 self.dropped_audio_ms_total += dropped
                 new_samples = max_advance_samples
 
-            # --- VAD Filtering ---
-            # Extract the newest samples to check for voice
+            # --- VAD Filtering (Offloaded to background thread to avoid event loop stalls) ---
             new_audio = window[-new_samples:]
+            
+            def _run_vad(audio_chunk):
+                min_samples_silero = 512
+                vad_audio_chunk = audio_chunk
+                if len(vad_audio_chunk) < min_samples_silero:
+                    vad_audio_chunk = np.pad(vad_audio_chunk, (0, min_samples_silero - len(vad_audio_chunk)))
 
-            # Use Silero VAD
-            min_samples_silero = 512
-            vad_audio = new_audio
-            if len(vad_audio) < min_samples_silero:
-                vad_audio = np.pad(vad_audio, (0, min_samples_silero - len(vad_audio)))
+                tensor_audio = torch.from_numpy(vad_audio_chunk).to(self.rt.device)
+                return self.silero_get_timestamps(
+                    tensor_audio,
+                    self.silero_vad_model,
+                    sampling_rate=16000,
+                    min_speech_duration_ms=20,
+                    min_silence_duration_ms=10
+                )
 
-            tensor_audio = torch.from_numpy(vad_audio).to(self.rt.device)
-            speech_timestamps = self.silero_get_timestamps(
-                tensor_audio,
-                self.silero_vad_model,
-                sampling_rate=16000,
-                min_speech_duration_ms=20,
-                min_silence_duration_ms=10
-            )
+            speech_timestamps = await asyncio.to_thread(_run_vad, new_audio)
+            
+            _vad_ms = (time.perf_counter() - _loop_start) * 1000
+            if _vad_ms > 10:
+                print(f"[ENGINE] VAD processing took {_vad_ms:.1f}ms (running in background thread)")
 
             speech_detected = len(speech_timestamps) > 0
 
@@ -472,16 +508,39 @@ class MuseTalkRealtimeEngine:
                 self._whisper_feature_cache = None
                 self._cache_audio_samples = 0
 
-            # Fixes "same lips over and over" by publishing only newly advanced tail frames.
+            # Adaptive frame production to cover inference latency (Claude Recommendation)
+            # Calculate how many frames we need to generate to cover the time spent in the loop
+            frames_to_cover_latency = math.ceil(self._infer_ms_ema / (1000.0 / self.args.fps))
+            
+            # Base frame count from audio advancement
             new_frames = max(1, int(round((new_samples / 16000.0) * self.args.fps)))
-            new_frames = min(new_frames, max(1, self.args.max_tail_frames))
+            
+            # Use the higher of the two, capped at batch size to stay real-time
+            new_frames = max(new_frames, frames_to_cover_latency)
+            new_frames = min(new_frames, self.args.batch_size)
+
             try:
                 frames = await asyncio.to_thread(self._infer_window_frames, window, new_frames, new_samples)
+                
+                _infer_ms = (time.perf_counter() - _loop_start) * 1000
+                print(f"[ENGINE] infer done: {len(frames)} frames in {_infer_ms:.1f}ms (EMA: {self._infer_ms_ema:.1f}ms) target={new_frames}")
+
                 for frame in frames:
                     await self.video_buffer.publish(frame)
+                    # Use stats object for the watchdog to see
+                    self.stats["last_video_send_epoch"] = time.time()
                     self.last_publish_epoch = time.time()
+                    # Yield control to the event loop so recv() can process frames during a batch
+                    await asyncio.sleep(0)
+
                 if frames:
                     self.jobs += 1
+                
+                _publish_ms = (time.perf_counter() - _loop_start) * 1000
+                # Update rolling average of loop latency
+                self._infer_ms_ema = 0.8 * self._infer_ms_ema + 0.2 * _publish_ms
+                print(f"[ENGINE] published {len(frames)} frames, total loop={_publish_ms:.1f}ms queue_now={self.video_buffer.queue.qsize()}")
+
             except Exception as e:
                 self.last_error = repr(e)
                 print(f"[engine] inference error: {e!r}")

@@ -119,10 +119,10 @@ class AudioTrackBuffer:
 
 
 class VideoFrameBuffer:
-    """Bounded queue of BGR frames with last-frame fallback semantics."""
+    """FIFO BGR frame buffer with last-frame fallback for pacing."""
 
-    def __init__(self, maxsize: int):
-        """Create bounded queue for generated avatar frames.
+    def __init__(self, maxsize: int = 64):
+        """Create a bounded FIFO buffer for generated avatar frames.
 
         Receives:
         - `maxsize`: queue capacity before dropping oldest frames.
@@ -151,21 +151,27 @@ class VideoFrameBuffer:
         with contextlib.suppress(asyncio.QueueFull):
             self.queue.put_nowait(frame_bgr)
 
-    async def get(self, timeout: float = 0.12) -> np.ndarray:
-        """Return next frame or fallback to last frame on timeout.
+    async def get_nowait(self) -> np.ndarray:
+        """Return the oldest frame in queue or last_frame if empty (non-blocking).
 
         Receives:
-        - `timeout`: maximum wait in seconds.
+        - None.
 
         Returns:
         - BGR frame (`np.ndarray`).
         """
 
         try:
-            frame = await asyncio.wait_for(self.queue.get(), timeout=timeout)
+            frame = self.queue.get_nowait()
             self.last_frame = frame
             return frame
-        except asyncio.TimeoutError:
+        except asyncio.QueueEmpty:
+            # Diagnostic log (Claude Recommendation)
+            if self.last_frame is not None:
+                # print("[BUFFER] get_nowait: queue empty, returning last_frame")
+                pass
+            else:
+                 print("[BUFFER] get_nowait: queue empty, NO LAST FRAME")
             return self.last_frame
 
     def snapshot_jpeg(self) -> bytes:
@@ -182,4 +188,3 @@ class VideoFrameBuffer:
         if not ok:
             return b""
         return enc.tobytes()
-

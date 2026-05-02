@@ -2,7 +2,13 @@
 
 try:
     import av
-    from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription
+    from aiortc import (
+        RTCConfiguration,
+        RTCIceServer,
+        RTCPeerConnection,
+        RTCRtpSender,
+        RTCSessionDescription,
+    )
     from aiortc.mediastreams import AudioStreamTrack, MediaStreamError, VideoStreamTrack
 
     AIORTC_AVAILABLE = True
@@ -12,6 +18,7 @@ except Exception:  # pragma: no cover - import availability depends on runtime i
     RTCConfiguration = None
     RTCIceServer = None
     RTCPeerConnection = None
+    RTCRtpSender = None
     RTCSessionDescription = None
     AudioStreamTrack = object
     MediaStreamError = RuntimeError
@@ -23,6 +30,7 @@ __all__ = [
     "RTCConfiguration",
     "RTCIceServer",
     "RTCPeerConnection",
+    "RTCRtpSender",
     "RTCSessionDescription",
     "AudioStreamTrack",
     "MediaStreamError",

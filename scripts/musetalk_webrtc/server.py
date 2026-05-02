@@ -691,7 +691,20 @@ class WebRtcApp:
                 await session.pc.close()
             self.pcs.discard(session.pc)
 
-        pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=self._aiortc_ice_servers()))
+        try:
+            pc = RTCPeerConnection(
+                configuration=RTCConfiguration(
+                    iceServers=self._aiortc_ice_servers(),
+                    iceTransportPolicy=self.args.ice_transport_policy,
+                )
+            )
+        except TypeError:
+            # Fallback for older aiortc versions where iceTransportPolicy is not supported in __init__
+            pc = RTCPeerConnection(
+                configuration=RTCConfiguration(
+                    iceServers=self._aiortc_ice_servers(),
+                )
+            )
         self.pcs.add(pc)
         pcid = f"pc_{id(pc)}"
         self.pc_states[pcid] = pc.connectionState
@@ -741,8 +754,19 @@ class WebRtcApp:
 
         video_track = MuseTalkVideoTrack(self.video_buffer, fps=self.args.fps, stats=self.track_stats)
         audio_track = MuseTalkAudioTrack(self.audio_track_buffer, stats=self.track_stats)
-        pc.addTrack(video_track)
+        video_sender = pc.addTrack(video_track)
         pc.addTrack(audio_track)
+
+        # Force H264 to enable hardware acceleration in browser and reduce decoding jitter
+        from .rtc import RTCRtpSender
+        capabilities = RTCRtpSender.getCapabilities("video")
+        if capabilities:
+            h264_codecs = [c for c in capabilities.codecs if c.mimeType == "video/H264"]
+            other_codecs = [c for c in capabilities.codecs if c.mimeType != "video/H264"]
+            for transceiver in pc.getTransceivers():
+                if transceiver.sender == video_sender:
+                    transceiver.setCodecPreferences(h264_codecs + other_codecs)
+                    break
 
         await pc.setRemoteDescription(offer)
         answer = await pc.createAnswer()
@@ -792,7 +816,8 @@ class WebRtcApp:
                 if pcm.size == 0:
                     continue
 
-                pcm16k = self._resample_audio(pcm, src_sr, 16000)
+                # FFT resampling is CPU intensive; run in background thread to avoid loop stalls
+                pcm16k = await self._resample_audio(pcm, src_sr, 16000)
                 session.mic_samples_rx_16k += int(pcm16k.size)
                 session.mic_frames_rx += 1
                 session.last_mic_rx_epoch = time.time()
@@ -808,14 +833,14 @@ class WebRtcApp:
                     )
 
                 if session.personaplex_bridge is not None:
-                    pcm24k_uplink = self._resample_audio(pcm, src_sr, 24000)
+                    pcm24k_uplink = await self._resample_audio(pcm, src_sr, 24000)
                     await session.personaplex_bridge.push_uplink_pcm24k(pcm24k_uplink)
 
                 if self.args.input_source in ("webrtc", "mixed") and session.personaplex_bridge is None:
                     await self.pcm_ring_16k.append(pcm16k)
 
                 if self.args.webrtc_audio_loopback and session.personaplex_bridge is None:
-                    pcm24k = self._resample_audio(pcm, src_sr, 24000)
+                    pcm24k = await self._resample_audio(pcm, src_sr, 24000)
                     await self.pcm_ring_24k.append(pcm24k)
                     await self.audio_track_buffer.append_from_24k(pcm24k)
         except asyncio.CancelledError:
@@ -825,14 +850,18 @@ class WebRtcApp:
             self._debug("mic.loop_error", session_id=session.session_id, error=repr(e))
             raise
 
-    def _resample_audio(self, pcm: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
-        """Resample mono PCM to target sample rate using polyphase filter."""
+    async def _resample_audio(self, pcm: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
+        """Resample mono PCM to target sample rate using polyphase filter (Offloaded)."""
 
         if src_sr == dst_sr:
             return pcm.astype(np.float32, copy=False)
         if src_sr <= 0 or dst_sr <= 0:
             return np.zeros((0,), dtype=np.float32)
-        return resample_poly(pcm, up=dst_sr, down=src_sr).astype(np.float32, copy=False)
+
+        def _sync_resample():
+            return resample_poly(pcm, up=dst_sr, down=src_sr).astype(np.float32, copy=False)
+
+        return await asyncio.to_thread(_sync_resample)
 
     @web.middleware
     async def auth_middleware(self, request: web.Request, handler):
