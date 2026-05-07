@@ -29,6 +29,8 @@ let sessionId = null;
 let sessionToken = null;
 let audioContext = null;
 let analyser = null;
+let remoteVideoStream = null;
+let remoteAudioStream = null;
 
 const startBtn = document.getElementById('start');
 const stopBtn = document.getElementById('stop');
@@ -101,6 +103,10 @@ async function cleanupPeer() {
     audioContext = null;
     analyser = null;
   }
+  remoteVideoStream = null;
+  remoteAudioStream = null;
+  document.getElementById('v').srcObject = null;
+  document.getElementById('a').srcObject = null;
   micLevelEl.style.width = '0%';
 }
 
@@ -148,6 +154,10 @@ async function start() {
       video: false,
     });
     setMic('granted (processed audio)');
+    const micTrack = localStream.getAudioTracks()[0];
+    if (micTrack && 'contentHint' in micTrack) {
+      micTrack.contentHint = 'speech';
+    }
 
     // IMPORTANT: When you route the microphone stream through the Web Audio API
     // to mix in silence, the browser's native WebRTC stack automatically STRIPS
@@ -165,7 +175,10 @@ async function start() {
 
     pc = new RTCPeerConnection(rtcCfg);
     pc.addTransceiver('video', { direction: 'recvonly' });
-    pc.addTransceiver('audio', { direction: 'recvonly' });
+    remoteVideoStream = new MediaStream();
+    remoteAudioStream = new MediaStream();
+    document.getElementById('v').srcObject = remoteVideoStream;
+    document.getElementById('a').srcObject = remoteAudioStream;
 
     // Send the original mic stream directly to WebRTC so DSP works properly
     for (const track of localStream.getAudioTracks()) {
@@ -176,9 +189,19 @@ async function start() {
     };
     pc.ontrack = (ev) => {
       if (ev.track.kind === 'video') {
-        document.getElementById('v').srcObject = ev.streams[0];
+        if (remoteVideoStream && !remoteVideoStream.getVideoTracks().some((track) => track.id === ev.track.id)) {
+          remoteVideoStream.addTrack(ev.track);
+        }
       } else if (ev.track.kind === 'audio') {
-        document.getElementById('a').srcObject = ev.streams[0];
+        if (!remoteAudioStream) return;
+        const existingAudioTracks = remoteAudioStream.getAudioTracks();
+        if (existingAudioTracks.length && existingAudioTracks[0].id !== ev.track.id) {
+          console.warn('Ignoring extra remote audio track', ev.track.id);
+          return;
+        }
+        if (!existingAudioTracks.some((track) => track.id === ev.track.id)) {
+          remoteAudioStream.addTrack(ev.track);
+        }
       }
     };
 
@@ -218,8 +241,6 @@ async function stop() {
   setState('stopping');
   await cleanupPeer();
   await cleanupSession();
-  document.getElementById('v').srcObject = null;
-  document.getElementById('a').srcObject = null;
   setMic('idle');
   setState('idle');
 }

@@ -85,6 +85,7 @@ class MuseTalkAudioTrack(AudioStreamTrack):
         self.audio_buffer = audio_buffer
         self.samples_per_frame = 960  # 20ms @ 48kHz
         self.sample_rate = 48000
+        self.frame_duration = self.samples_per_frame / self.sample_rate
         self.stats = stats
 
     async def recv(self):
@@ -101,24 +102,33 @@ class MuseTalkAudioTrack(AudioStreamTrack):
             raise RuntimeError("aiortc/av is not installed")
         if self.readyState != "live":
             raise MediaStreamError
+
+        # Use a deadline-based audio clock. If the event loop stalls, snap the
+        # deadline forward instead of burst-sending many overdue frames into the
+        # browser jitter buffer.
+        now = time.time()
+        if not hasattr(self, "_next_send_time"):
+            self._next_send_time = now
+            self._audio_pts = 0
+
+        sleep_needed = self._next_send_time - now
+        if sleep_needed > 0:
+            await asyncio.sleep(sleep_needed)
+
+        self._next_send_time = max(
+            self._next_send_time + self.frame_duration,
+            time.time() - (self.frame_duration * 3),
+        )
+
         pcm = await self.audio_buffer.pop_48k(self.samples_per_frame)
         pcm_i16 = (np.clip(pcm, -1.0, 1.0) * 32767.0).astype(np.int16)
 
-        # AudioStreamTrack in aiortc does not provide next_timestamp() (video-only helper),
-        # so we keep our own 48k clock here.
-        if hasattr(self, "_timestamp"):
-            self._timestamp += self.samples_per_frame
-            wait = self._start + (self._timestamp / self.sample_rate) - time.time()
-            await asyncio.sleep(max(0.0, wait))
-        else:
-            self._start = time.time()
-            self._timestamp = 0
-
         frame = av.AudioFrame(format="s16", layout="mono", samples=self.samples_per_frame)
-        frame.sample_rate = 48000
+        frame.sample_rate = self.sample_rate
         frame.planes[0].update(pcm_i16.tobytes())
-        frame.pts = self._timestamp
+        frame.pts = self._audio_pts
         frame.time_base = fractions.Fraction(1, self.sample_rate)
+        self._audio_pts += self.samples_per_frame
         self.stats["audio_frames_sent"] = self.stats.get("audio_frames_sent", 0) + 1
         self.stats["last_audio_send_epoch"] = time.time()
         return frame

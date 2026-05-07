@@ -59,6 +59,80 @@ class PcmRingBuffer:
                 return self.buf.copy(), self.total_samples
             return self.buf[-n_samples:].copy(), self.total_samples
 
+    async def wait_for_total_after(self, total_samples: int, timeout: float) -> bool:
+        """Wait until the cumulative sample counter advances past `total_samples`.
+
+        This clears the event only while holding the buffer lock and only after
+        confirming no newer samples are present, which avoids missed wakeups
+        between a caller's `latest()` read and a subsequent `Event.clear()`.
+
+        Receives:
+        - `total_samples`: last observed cumulative sample count.
+        - `timeout`: max seconds to wait.
+
+        Returns:
+        - `True` if newer samples arrived before timeout, else `False`.
+        """
+
+        while True:
+            async with self.lock:
+                if self.total_samples > total_samples:
+                    return True
+                self.new_data_event.clear()
+            try:
+                await asyncio.wait_for(self.new_data_event.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                return False
+
+
+class StreamingLinearResampler:
+    """Low-latency stateful linear resampler for chunked mono PCM streams.
+
+    This avoids per-chunk filter resets that can introduce audible ticks or
+    feature glitches when short websocket PCM packets are resampled
+    independently.
+    """
+
+    def __init__(self, src_rate: int, dst_rate: int):
+        self.src_rate = int(src_rate)
+        self.dst_rate = int(dst_rate)
+        self.step = float(self.src_rate) / float(self.dst_rate)
+        self._buf = np.zeros((0,), dtype=np.float32)
+        self._next_pos = 0.0
+
+    def process(self, samples: np.ndarray) -> np.ndarray:
+        if samples.size == 0:
+            return np.zeros((0,), dtype=np.float32)
+
+        chunk = np.asarray(samples, dtype=np.float32).reshape(-1)
+        if self._buf.size == 0:
+            self._buf = chunk.copy()
+        else:
+            self._buf = np.concatenate([self._buf, chunk])
+
+        # Need at least two points for interpolation.
+        if self._buf.size < 2:
+            return np.zeros((0,), dtype=np.float32)
+
+        out = []
+        max_pos = float(self._buf.size - 1)
+        while self._next_pos < max_pos:
+            left = int(self._next_pos)
+            frac = self._next_pos - left
+            right = left + 1
+            sample = self._buf[left] * (1.0 - frac) + self._buf[right] * frac
+            out.append(sample)
+            self._next_pos += self.step
+
+        keep_from = max(0, int(self._next_pos) - 1)
+        if keep_from > 0:
+            self._buf = self._buf[keep_from:]
+            self._next_pos -= keep_from
+
+        if not out:
+            return np.zeros((0,), dtype=np.float32)
+        return np.asarray(out, dtype=np.float32)
+
 
 class AudioTrackBuffer:
     """Buffered 48k mono sample queue feeding outbound WebRTC audio track."""
@@ -76,6 +150,7 @@ class AudioTrackBuffer:
         self.max_samples = max_samples_48k
         self.buf = np.zeros((0,), dtype=np.float32)
         self.lock = asyncio.Lock()
+        self._upsampler_24k_to_48k = StreamingLinearResampler(src_rate=24000, dst_rate=48000)
 
     async def append_from_24k(self, mono24k: np.ndarray) -> None:
         """Append 24kHz mono PCM by upsampling to 48kHz.
@@ -89,7 +164,9 @@ class AudioTrackBuffer:
 
         if mono24k.size == 0:
             return
-        mono48k = np.repeat(mono24k.astype(np.float32, copy=False), 2)
+        mono48k = self._upsampler_24k_to_48k.process(mono24k.astype(np.float32, copy=False))
+        if mono48k.size == 0:
+            return
         async with self.lock:
             self.buf = np.concatenate([self.buf, mono48k])
             if self.buf.size > self.max_samples:

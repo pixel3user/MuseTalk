@@ -12,9 +12,8 @@ from typing import Any, Callable, Optional
 import aiohttp
 import numpy as np
 import sphn
-from scipy.signal import resample_poly
 
-from .buffers import AudioTrackBuffer, PcmRingBuffer
+from .buffers import AudioTrackBuffer, PcmRingBuffer, StreamingLinearResampler
 from .models import SessionState
 
 class PersonaPlexMirrorClient:
@@ -46,6 +45,7 @@ class PersonaPlexMirrorClient:
         self.ring16k = pcm_ring_16k
         self.audio_track_buffer = audio_track_buffer
         self.reader = sphn.OpusStreamReader(24000)
+        self._to16k = StreamingLinearResampler(src_rate=24000, dst_rate=16000)
         self.status_json = status_json
         self.reconnect_delay_seconds = reconnect_delay_seconds
         self.stop_event = asyncio.Event()
@@ -116,9 +116,9 @@ class PersonaPlexMirrorClient:
                                 continue
                             pcm = np.asarray(pcm, dtype=np.float32).reshape(-1)
                             await self.ring.append(pcm)
-                            # Fast incremental 24k -> 16k conversion (2/3) for inference path.
-                            pcm16k = resample_poly(pcm, up=2, down=3).astype(np.float32, copy=False)
-                            await self.ring16k.append(pcm16k)
+                            pcm16k = self._to16k.process(pcm)
+                            if pcm16k.size > 0:
+                                await self.ring16k.append(pcm16k)
                             await self.audio_track_buffer.append_from_24k(pcm)
                             self.decoded_seconds += pcm.size / 24000.0
                             self.last_rx_epoch = time.time()
@@ -166,6 +166,7 @@ class PersonaPlexChatBridge:
         self.uplink_queue = asyncio.Queue(maxsize=64)
         self.reader = sphn.OpusStreamReader(24000)
         self.writer = sphn.OpusStreamWriter(24000)
+        self._to16k = StreamingLinearResampler(src_rate=24000, dst_rate=16000)
         self.last_error = ""
         self.handshake_epoch = 0.0
         self.rx_packets = 0
@@ -241,8 +242,9 @@ class PersonaPlexChatBridge:
                 continue
             pcm24k = np.asarray(pcm24k, dtype=np.float32).reshape(-1)
             await self.pcm_ring_24k.append(pcm24k)
-            pcm16k = resample_poly(pcm24k, up=2, down=3).astype(np.float32, copy=False)
-            await self.pcm_ring_16k.append(pcm16k)
+            pcm16k = self._to16k.process(pcm24k)
+            if pcm16k.size > 0:
+                await self.pcm_ring_16k.append(pcm16k)
             await self.audio_track_buffer.append_from_24k(pcm24k)
             self.session.personaplex_audio_frames_rx += 1
             self.session.personaplex_last_rx_epoch = time.time()
