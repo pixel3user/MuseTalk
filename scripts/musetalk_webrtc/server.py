@@ -8,7 +8,7 @@ import json
 import secrets
 import time
 import uuid
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import urlencode
 
 import cv2
@@ -18,7 +18,7 @@ from scipy.signal import resample_poly
 
 from .buffers import AudioTrackBuffer, PcmRingBuffer, VideoFrameBuffer
 from .constants import SESSION_TOKEN_HEADER
-from .engine import MuseTalkRealtimeEngine
+from .engine_protocol import InferenceEngine
 from .models import AppArgs, SessionState
 from .personaplex_io import PersonaPlexChatBridge, PersonaPlexMirrorClient
 from .rtc import (
@@ -31,14 +31,38 @@ from .rtc import (
 from .tracks import MuseTalkAudioTrack, MuseTalkVideoTrack
 from .web_ui import HTML_PAGE
 
+
+def _default_engine_factory(
+    args: AppArgs,
+    pcm_ring_16k: PcmRingBuffer,
+    video_buffer: VideoFrameBuffer,
+) -> InferenceEngine:
+    """Default engine factory that imports and constructs the real GPU engine.
+
+    This function performs the heavy `from .engine import MuseTalkRealtimeEngine`
+    lazily, so that tests injecting a FakeInferenceEngine never trigger torch
+    import or GPU initialization.
+    """
+    from .engine import MuseTalkRealtimeEngine
+
+    return MuseTalkRealtimeEngine(args=args, pcm_ring_16k=pcm_ring_16k, video_buffer=video_buffer)
+
 class WebRtcApp:
     """Aiohttp app state container for signaling, sessions, and media bridges."""
 
-    def __init__(self, args: AppArgs):
+    def __init__(
+        self,
+        args: AppArgs,
+        *,
+        engine_factory: Optional[Callable[..., InferenceEngine]] = None,
+    ):
         """Build buffers, optional clients, and runtime state.
 
         Receives:
         - `args`: validated runtime config.
+        - `engine_factory`: optional callable(args, pcm_ring_16k, video_buffer) -> InferenceEngine.
+          Defaults to _default_engine_factory which imports the real GPU engine.
+          Pass engines.fake.FakeInferenceEngine for GPU-free testing.
 
         Returns:
         - `None`.
@@ -58,6 +82,7 @@ class WebRtcApp:
         }
         self.debug_events: list[dict[str, Any]] = []
         self.debug_events_limit = max(25, int(args.debug_events_limit))
+        self._healthy = True  # Set to False if a critical task dies unexpectedly
 
         ring_samples = int(args.ring_buffer_seconds * 24000)
         self.pcm_ring_24k = PcmRingBuffer(max_samples=ring_samples)
@@ -66,7 +91,7 @@ class WebRtcApp:
         self.video_buffer = VideoFrameBuffer(maxsize=args.video_queue_size)
 
         self.mirror_client: Optional[PersonaPlexMirrorClient] = None
-        self.engine: Optional[MuseTalkRealtimeEngine] = None
+        self.engine: Optional[InferenceEngine] = None
         if not args.web_test_only:
             if (not args.musetalk_only) and (not self._personaplex_chat_enabled()):
                 ws_url = self._build_mirror_ws_url()
@@ -78,11 +103,8 @@ class WebRtcApp:
                     status_json=args.status_json,
                     reconnect_delay_seconds=args.reconnect_delay_seconds,
                 )
-            self.engine = MuseTalkRealtimeEngine(
-                args=args,
-                pcm_ring_16k=self.pcm_ring_16k,
-                video_buffer=self.video_buffer,
-            )
+            factory = engine_factory or _default_engine_factory
+            self.engine = factory(args, self.pcm_ring_16k, self.video_buffer)
         else:
             self._seed_web_test_frame()
 
@@ -311,9 +333,31 @@ class WebRtcApp:
         )
         if self.mirror_client is not None and self.args.input_source in ("mirror", "mixed"):
             self.mirror_task = asyncio.create_task(self.mirror_client.run())
+            self.mirror_task.add_done_callback(
+                lambda t: self._on_critical_task_done(t, "mirror")
+            )
         if self.engine is not None:
             self.engine_task = asyncio.create_task(self.engine.run())
+            self.engine_task.add_done_callback(
+                lambda t: self._on_critical_task_done(t, "engine")
+            )
         self.session_cleanup_task = asyncio.create_task(self._session_cleanup_loop())
+
+    def _on_critical_task_done(self, task: asyncio.Task, name: str) -> None:
+        """Callback for critical background tasks: mark unhealthy on unexpected death."""
+        if task.cancelled():
+            # Cancelled during shutdown — expected, no action needed.
+            return
+        exc = task.exception()
+        if exc is not None:
+            self._healthy = False
+            self._debug(
+                "task.critical_failure",
+                task_name=name,
+                error=repr(exc),
+                healthy=False,
+            )
+            print(f"[CRITICAL] Task '{name}' died unexpectedly: {exc!r}. Server marked unhealthy.")
 
     async def on_cleanup(self, _app: web.Application):
         """Aiohttp cleanup hook: stop tasks, close sessions, close peers."""
@@ -418,18 +462,19 @@ class WebRtcApp:
         return web.Response(body=data, content_type="image/jpeg")
 
     async def healthz(self, _request: web.Request) -> web.Response:
-        """Lightweight liveness/readiness endpoint."""
+        """Lightweight liveness endpoint. Returns 503 if a critical task has died."""
 
         await self._expire_stale_sessions()
-        return web.json_response(
-            {
-                "ok": True,
-                "aiortc_available": AIORTC_AVAILABLE,
-                "uptime_seconds": round(time.time() - self.started_epoch, 1),
-                "active_session_id": self.active_session_id,
-                "session_count": len(self.sessions),
-            }
-        )
+        payload = {
+            "ok": self._healthy,
+            "aiortc_available": AIORTC_AVAILABLE,
+            "uptime_seconds": round(time.time() - self.started_epoch, 1),
+            "active_session_id": self.active_session_id,
+            "session_count": len(self.sessions),
+            "healthy": self._healthy,
+        }
+        status_code = 200 if self._healthy else 503
+        return web.json_response(payload, status=status_code)
 
     async def config_v1(self, _request: web.Request) -> web.Response:
         """Return v1 API metadata including token header contract."""
@@ -728,7 +773,29 @@ class WebRtcApp:
                 pcid=pcid,
                 state=pc.connectionState,
             )
-            if pc.connectionState in ("failed", "closed"):
+            if pc.connectionState == "disconnected":
+                # Instrument disconnect timestamp for observability.
+                # Does NOT close the session yet — allows ICE reconnection.
+                session.disconnected_at = time.time()
+                self._debug(
+                    "webrtc.disconnected",
+                    session_id=session.session_id,
+                    pcid=pcid,
+                    hint="awaiting ICE reconnection or grace timeout",
+                )
+            elif pc.connectionState == "connected":
+                # Clear disconnect tracking on successful reconnect.
+                if session.disconnected_at > 0:
+                    reconnect_ms = round((time.time() - session.disconnected_at) * 1000, 1)
+                    self._debug(
+                        "webrtc.reconnected",
+                        session_id=session.session_id,
+                        pcid=pcid,
+                        reconnect_ms=reconnect_ms,
+                    )
+                session.disconnected_at = 0.0
+            elif pc.connectionState in ("failed", "closed"):
+                session.disconnected_at = 0.0
                 await pc.close()
                 self.pcs.discard(pc)
                 self.pc_states[pcid] = "closed"

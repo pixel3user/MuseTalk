@@ -109,3 +109,4 @@ class SessionState:
     personaplex_bridge: Optional["PersonaPlexChatBridge"] = None
     personaplex_bridge_task: Optional[asyncio.Task] = None
     close_reason: str = ""
+    disconnected_at: float = 0.0  # epoch when pc entered 'disconnected'; 0 = never/recovered

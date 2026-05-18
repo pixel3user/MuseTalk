@@ -92,7 +92,11 @@ class PersonaPlexMirrorClient:
             while not self.stop_event.is_set():
                 try:
                     print(f"[mirror] connecting: {self.ws_url}")
-                    async with session.ws_connect(self.ws_url, heartbeat=None) as ws:
+                    async with session.ws_connect(
+                        self.ws_url,
+                        heartbeat=None,
+                        timeout=aiohttp.ClientTimeout(total=30, sock_connect=5),
+                    ) as ws:
                         self.connected = True
                         self._write_status()
                         async for msg in ws:
@@ -309,7 +313,11 @@ class PersonaPlexChatBridge:
             while not self.stop_event.is_set():
                 self.handshake.clear()
                 try:
-                    async with session.ws_connect(self.ws_url, heartbeat=20.0) as ws:
+                    async with session.ws_connect(
+                        self.ws_url,
+                        heartbeat=20.0,
+                        timeout=aiohttp.ClientTimeout(total=30, sock_connect=5),
+                    ) as ws:
                         self.session.personaplex_connected = True
                         if self.debug_log is not None:
                             self.debug_log(
