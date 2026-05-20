@@ -140,6 +140,16 @@ def parse_args() -> AppArgs:
         ),
     )
     parser.add_argument(
+        "--ice-gather-timeout-seconds",
+        type=float,
+        default=5.0,
+        help=(
+            "Maximum seconds to wait for ICE gathering to complete before "
+            "returning the SDP answer. Increase for slow networks or TURN "
+            "relay candidates. Default 5s (was hardcoded 3s)."
+        ),
+    )
+    parser.add_argument(
         "--multi-session",
         action="store_true",
         help="Allow multiple concurrent sessions (disabled by default).",
@@ -221,6 +231,7 @@ def parse_args() -> AppArgs:
         session_max_age_seconds=ns.session_max_age_seconds,
         session_cleanup_interval_seconds=ns.session_cleanup_interval_seconds,
         session_disconnect_grace_seconds=ns.session_disconnect_grace_seconds,
+        ice_gather_timeout_seconds=ns.ice_gather_timeout_seconds,
         single_session_mode=(not ns.multi_session),
         web_test_only=ns.web_test_only,
         debug=ns.debug,

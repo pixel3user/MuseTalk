@@ -34,6 +34,7 @@ from .rtc import (
     RTCSessionDescription,
 )
 from .tracks import MuseTalkAudioTrack, MuseTalkVideoTrack
+from .metrics import METRICS, metrics_handler
 from .web_ui import HTML_PAGE
 
 
@@ -531,7 +532,11 @@ class WebRtcApp:
         return web.Response(body=data, content_type="image/jpeg")
 
     async def healthz(self, _request: web.Request) -> web.Response:
-        """Lightweight liveness endpoint. Returns 503 if a critical task has died."""
+        """Lightweight liveness endpoint. Returns 503 if a critical task has died.
+
+        Use this for Kubernetes livenessProbe / serverless platform health checks.
+        It answers: "Is the process fundamentally alive?"
+        """
 
         await self._expire_stale_sessions()
         payload = {
@@ -545,6 +550,57 @@ class WebRtcApp:
         status_code = 200 if self._healthy else 503
         return web.json_response(payload, status=status_code)
 
+    async def readyz(self, _request: web.Request) -> web.Response:
+        """Readiness endpoint. Returns 503 until models are warm and pipeline is functional.
+
+        Use this for Kubernetes readinessProbe / serverless platform readiness gates.
+        It answers: "Should traffic be routed to this instance?"
+
+        Conditions for ready=True:
+        1. Process is healthy (no critical task has died).
+        2. Engine has published at least one frame (models loaded + warmup done).
+           - In web_test_only mode, always ready (no engine).
+        3. If using mirror mode, mirror client has connected at least once.
+           - In chat/musetalk-only mode, mirror is not required.
+
+        This prevents the serverless platform from routing /offer requests
+        before the GPU models are loaded, which was a major source of
+        "sometimes works on cold start" failures.
+        """
+
+        reasons: list[str] = []
+
+        # Condition 1: process alive
+        if not self._healthy:
+            reasons.append("unhealthy: critical task has died")
+
+        # Condition 2: engine warm (has published at least one frame)
+        if self.engine is not None:
+            if not hasattr(self.engine, "last_publish_epoch") or self.engine.last_publish_epoch == 0.0:
+                # Engine exists but hasn't produced any output yet → still warming up
+                # Check if it has a 'ready' event (FakeEngine has this; real engine
+                # signals readiness by publishing its first frame)
+                engine_ready = getattr(self.engine, "ready", None)
+                if engine_ready is not None and hasattr(engine_ready, "is_set"):
+                    if not engine_ready.is_set():
+                        reasons.append("engine: not ready (warming up)")
+                elif self.engine.last_publish_epoch == 0.0:
+                    reasons.append("engine: no frames published yet (warming up)")
+
+        # Condition 3: mirror connected (if applicable)
+        if self.mirror_client is not None and self.args.input_source in ("mirror", "mixed"):
+            if not self.mirror_client.connected and self.mirror_client.packets == 0:
+                reasons.append("mirror: never connected to PersonaPlex")
+
+        ready = len(reasons) == 0
+        payload = {
+            "ready": ready,
+            "reasons": reasons if not ready else [],
+            "uptime_seconds": round(time.time() - self.started_epoch, 1),
+        }
+        status_code = 200 if ready else 503
+        return web.json_response(payload, status=status_code)
+
     async def config_v1(self, _request: web.Request) -> web.Response:
         """Return v1 API metadata including token header contract."""
 
@@ -556,6 +612,12 @@ class WebRtcApp:
                 "auth_enabled": self.args.enable_api_auth,
             }
         )
+
+    async def _metrics_handler(self, request: web.Request) -> web.Response:
+        """Serve Prometheus metrics at /metrics."""
+        # Update session gauge before serving
+        METRICS.sessions_active.set(len(self.sessions))
+        return await metrics_handler(request)
 
     async def active_session(self, _request: web.Request) -> web.Response:
         """Return current active session payload, if any."""
@@ -753,6 +815,7 @@ class WebRtcApp:
         """
 
         await self._expire_stale_sessions()
+        METRICS.offers_total.inc()
 
         # Idempotency check FIRST, before any session creation/close.
         idempotency_key = request.headers.get(IDEMPOTENCY_KEY_HEADER, "").strip()
@@ -937,7 +1000,7 @@ class WebRtcApp:
         await pc.setRemoteDescription(offer)
         answer = await pc.createAnswer()
         await pc.setLocalDescription(answer)
-        await self._wait_for_ice_gathering(pc, timeout=3.0)
+        await self._wait_for_ice_gathering(pc, timeout=self.args.ice_gather_timeout_seconds)
         self._debug("offer.answer_ready", session_id=session.session_id, pcid=pcid)
 
         payload = {
@@ -1070,6 +1133,8 @@ class WebRtcApp:
         app.on_cleanup.append(self.on_cleanup)
         app.router.add_get("/", self.index)
         app.router.add_get("/healthz", self.healthz)
+        app.router.add_get("/readyz", self.readyz)
+        app.router.add_get("/metrics", self._metrics_handler)
         app.router.add_get("/config", self.config)
         app.router.add_get("/status", self.status)
         app.router.add_get("/snapshot.jpg", self.snapshot)
