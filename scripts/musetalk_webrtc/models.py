@@ -71,6 +71,7 @@ class AppArgs:
     session_offer_timeout_seconds: float
     session_max_age_seconds: float
     session_cleanup_interval_seconds: float
+    session_disconnect_grace_seconds: float
     single_session_mode: bool
     web_test_only: bool
     debug: bool

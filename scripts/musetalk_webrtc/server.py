@@ -17,7 +17,12 @@ from aiohttp import web
 from scipy.signal import resample_poly
 
 from .buffers import AudioTrackBuffer, PcmRingBuffer, VideoFrameBuffer
-from .constants import SESSION_TOKEN_HEADER
+from .constants import (
+    IDEMPOTENCY_CACHE_MAX_ENTRIES,
+    IDEMPOTENCY_KEY_HEADER,
+    IDEMPOTENCY_TTL_SECONDS,
+    SESSION_TOKEN_HEADER,
+)
 from .engine_protocol import InferenceEngine
 from .models import AppArgs, SessionState
 from .personaplex_io import PersonaPlexChatBridge, PersonaPlexMirrorClient
@@ -83,6 +88,11 @@ class WebRtcApp:
         self.debug_events: list[dict[str, Any]] = []
         self.debug_events_limit = max(25, int(args.debug_events_limit))
         self._healthy = True  # Set to False if a critical task dies unexpectedly
+
+        # Idempotency cache for /offer retries: maps idempotency key to
+        # {"payload": <answer_dict>, "expires_at": <epoch>}. Keys are bounded
+        # by IDEMPOTENCY_CACHE_MAX_ENTRIES via LRU-ish trimming on insert.
+        self._idempotency_cache: dict[str, dict[str, Any]] = {}
 
         ring_samples = int(args.ring_buffer_seconds * 24000)
         self.pcm_ring_24k = PcmRingBuffer(max_samples=ring_samples)
@@ -194,6 +204,52 @@ class WebRtcApp:
                 return body
         return {}
 
+    def _idempotency_lookup(self, key: str) -> Optional[dict[str, Any]]:
+        """Return cached answer payload for `key` if present and not expired.
+
+        Returns the stored payload dict (suitable for json_response) or None.
+        Side effect: removes expired entries encountered during lookup.
+        """
+        if not key:
+            return None
+        entry = self._idempotency_cache.get(key)
+        if entry is None:
+            return None
+        if entry["expires_at"] <= time.time():
+            self._idempotency_cache.pop(key, None)
+            return None
+        return entry["payload"]
+
+    def _idempotency_store(self, key: str, payload: dict[str, Any]) -> None:
+        """Cache `payload` under `key` for IDEMPOTENCY_TTL_SECONDS.
+
+        Keeps the cache bounded: if it exceeds IDEMPOTENCY_CACHE_MAX_ENTRIES,
+        we drop the oldest expired entries first, then the oldest in general.
+        """
+        if not key:
+            return
+        now = time.time()
+        # Bound the cache. Cheap O(N) sweep on insert is fine because
+        # the cache is small (a few hundred entries at most) and inserts
+        # happen on the order of /offer requests, not per audio frame.
+        if len(self._idempotency_cache) >= IDEMPOTENCY_CACHE_MAX_ENTRIES:
+            # First pass: drop expired
+            expired = [k for k, v in self._idempotency_cache.items() if v["expires_at"] <= now]
+            for k in expired:
+                self._idempotency_cache.pop(k, None)
+            # Still over? Drop oldest by expires_at.
+            if len(self._idempotency_cache) >= IDEMPOTENCY_CACHE_MAX_ENTRIES:
+                victims = sorted(
+                    self._idempotency_cache.items(),
+                    key=lambda kv: kv[1]["expires_at"],
+                )[: max(1, IDEMPOTENCY_CACHE_MAX_ENTRIES // 4)]
+                for k, _ in victims:
+                    self._idempotency_cache.pop(k, None)
+        self._idempotency_cache[key] = {
+            "payload": payload,
+            "expires_at": now + IDEMPOTENCY_TTL_SECONDS,
+        }
+
     def _touch_session(self, session: SessionState) -> None:
         """Refresh session activity timestamp."""
 
@@ -216,6 +272,19 @@ class WebRtcApp:
         state = self._session_state(session)
         if session.pc is None and age > max(1.0, self.args.session_offer_timeout_seconds):
             return True, "offer_timeout"
+
+        # Disconnect grace period: if ICE went 'disconnected' and didn't
+        # recover within session_disconnect_grace_seconds, close the session
+        # so the client re-offers cleanly. This is the production fix for
+        # "mobile users get stuck after WiFi/LTE handoff".
+        #
+        # NOTE: disconnected_at is only set/cleared by the connectionstatechange
+        # handler in _handle_offer; sessions that never reached 'connected'
+        # use the older offer_timeout/idle path above.
+        grace = max(1.0, float(self.args.session_disconnect_grace_seconds))
+        if session.disconnected_at > 0 and (now - session.disconnected_at) > grace:
+            return True, "disconnect_grace_exceeded"
+
         if state in {"closed", "failed", "disconnected"}:
             idle = now - session.last_activity_epoch
             if idle > max(5.0, self.args.session_cleanup_interval_seconds * 2.0):
@@ -675,16 +744,46 @@ class WebRtcApp:
         print(f"[personaplex-chat] started for session={session.session_id} url={ws_url}")
 
     async def offer(self, request: web.Request) -> web.Response:
-        """Legacy offer endpoint that auto-creates session and returns answer."""
+        """Legacy offer endpoint that auto-creates session and returns answer.
+
+        Supports idempotency: if the request includes an `x-idempotency-key`
+        header AND a cached answer exists for that key, returns the cached
+        answer instead of creating a new session. This prevents fetch retries
+        on flaky networks from churning sessions in single-session mode.
+        """
 
         await self._expire_stale_sessions()
+
+        # Idempotency check FIRST, before any session creation/close.
+        idempotency_key = request.headers.get(IDEMPOTENCY_KEY_HEADER, "").strip()
+        cached = self._idempotency_lookup(idempotency_key)
+        if cached is not None:
+            self._debug(
+                "offer.idempotent_hit",
+                remote=request.remote or "",
+                key_prefix=idempotency_key[:8],
+            )
+            return web.json_response(cached)
+
         self._debug("offer.legacy.request", remote=request.remote or "")
         if self.args.single_session_mode:
             active = self._active_session()
             if active is not None:
                 await self._close_session(active, reason="legacy_offer_replaced")
         session = self._create_session()
-        return await self._handle_offer(request, session=session, include_session_token=True)
+        response = await self._handle_offer(
+            request, session=session, include_session_token=True
+        )
+
+        # Cache the answer for IDEMPOTENCY_TTL_SECONDS so retries return the
+        # same payload. We extract the JSON body from the response object.
+        if idempotency_key and response.status == 200:
+            with contextlib.suppress(Exception):
+                # response.body is bytes for json_response; round-trip via json.
+                payload = json.loads(response.body)
+                self._idempotency_store(idempotency_key, payload)
+
+        return response
 
     async def session_offer(self, request: web.Request) -> web.Response:
         """Session-bound offer endpoint (`/v1/sessions/{id}/offer`)."""

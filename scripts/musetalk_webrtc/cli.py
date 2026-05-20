@@ -130,6 +130,16 @@ def parse_args() -> AppArgs:
         help="Background interval for expiring stale sessions.",
     )
     parser.add_argument(
+        "--session-disconnect-grace-seconds",
+        type=float,
+        default=10.0,
+        help=(
+            "How long a session may remain in WebRTC 'disconnected' state "
+            "before being closed. Allows ICE to reconnect after WiFi/LTE "
+            "handoff or transient network loss."
+        ),
+    )
+    parser.add_argument(
         "--multi-session",
         action="store_true",
         help="Allow multiple concurrent sessions (disabled by default).",
@@ -210,6 +220,7 @@ def parse_args() -> AppArgs:
         session_offer_timeout_seconds=ns.session_offer_timeout_seconds,
         session_max_age_seconds=ns.session_max_age_seconds,
         session_cleanup_interval_seconds=ns.session_cleanup_interval_seconds,
+        session_disconnect_grace_seconds=ns.session_disconnect_grace_seconds,
         single_session_mode=(not ns.multi_session),
         web_test_only=ns.web_test_only,
         debug=ns.debug,

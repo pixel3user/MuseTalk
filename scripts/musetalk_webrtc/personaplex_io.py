@@ -13,6 +13,7 @@ import aiohttp
 import numpy as np
 import sphn
 
+from .backoff import BackoffPolicy, compute_backoff
 from .buffers import AudioTrackBuffer, PcmRingBuffer, StreamingLinearResampler
 from .models import SessionState
 
@@ -88,6 +89,15 @@ class PersonaPlexMirrorClient:
         - `None` (runs until `stop_event` is set).
         """
 
+        # Backoff policy: base=reconnect_delay, cap=30s, doubling per attempt.
+        # The first attempt uses base directly; subsequent failures back off
+        # exponentially with full jitter to avoid thundering-herd reconnects.
+        policy = BackoffPolicy(
+            base_seconds=max(0.2, self.reconnect_delay_seconds),
+            cap_seconds=30.0,
+        )
+        attempt = 0
+
         async with aiohttp.ClientSession() as session:
             while not self.stop_event.is_set():
                 try:
@@ -98,6 +108,9 @@ class PersonaPlexMirrorClient:
                         timeout=aiohttp.ClientTimeout(total=30, sock_connect=5),
                     ) as ws:
                         self.connected = True
+                        # Successful connection: reset backoff so a single
+                        # transient drop doesn't permanently slow reconnects.
+                        attempt = 0
                         self._write_status()
                         async for msg in ws:
                             if msg.type != aiohttp.WSMsgType.BINARY:
@@ -131,7 +144,9 @@ class PersonaPlexMirrorClient:
                     self.connected = False
                     self._write_status()
                     print(f"[mirror] connection error: {e!r}")
-                    await asyncio.sleep(max(0.2, self.reconnect_delay_seconds))
+                    delay = compute_backoff(attempt, policy)
+                    attempt += 1
+                    await asyncio.sleep(delay)
 
 
 class PersonaPlexChatBridge:
@@ -309,6 +324,16 @@ class PersonaPlexChatBridge:
         - `None` (runs until `stop_event` is set).
         """
 
+        # Backoff policy: same shape as mirror but per-bridge instance.
+        # Reset attempt to 0 once we receive a handshake (real success),
+        # not just on TCP connect, because PersonaPlex sometimes accepts
+        # the websocket then immediately closes it.
+        policy = BackoffPolicy(
+            base_seconds=max(0.2, self.reconnect_delay_seconds),
+            cap_seconds=30.0,
+        )
+        attempt = 0
+
         async with aiohttp.ClientSession() as session:
             while not self.stop_event.is_set():
                 self.handshake.clear()
@@ -327,10 +352,21 @@ class PersonaPlexChatBridge:
                             )
                         recv_task = asyncio.create_task(self._recv_loop(ws))
                         send_task = asyncio.create_task(self._send_loop(ws))
+                        # Watch for handshake to reset backoff: a successful
+                        # voice load means subsequent reconnects should be quick.
+                        async def _watch_handshake() -> None:
+                            nonlocal attempt
+                            await self.handshake.wait()
+                            attempt = 0
+
+                        watch_task = asyncio.create_task(_watch_handshake())
                         done, pending = await asyncio.wait(
                             [recv_task, send_task],
                             return_when=asyncio.FIRST_COMPLETED,
                         )
+                        watch_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError, Exception):
+                            await watch_task
                         for task in pending:
                             task.cancel()
                         for task in pending:
@@ -348,11 +384,14 @@ class PersonaPlexChatBridge:
                             "personaplex_chat.error",
                             session_id=self.session.session_id,
                             error=self.last_error,
+                            attempt=attempt,
                         )
                     if not self.stop_event.is_set() and not isinstance(
                         e, (aiohttp.ClientConnectionError, ConnectionResetError)
                     ):
                         print(f"[personaplex-chat] bridge error: {e!r}")
                 if not self.stop_event.is_set():
-                    await asyncio.sleep(max(0.2, self.reconnect_delay_seconds))
+                    delay = compute_backoff(attempt, policy)
+                    attempt += 1
+                    await asyncio.sleep(delay)
         self.session.personaplex_connected = False
