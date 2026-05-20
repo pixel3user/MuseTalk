@@ -164,6 +164,7 @@ class FakeInferenceEngine:
 
             if self.last_total_samples < 0:
                 new_samples = int(window.size)
+                self.last_total_samples = total - new_samples
             else:
                 new_samples = max(0, int(total - self.last_total_samples))
 
@@ -173,13 +174,10 @@ class FakeInferenceEngine:
                 await self.pcm_ring.wait_for_total_after(total, timeout=0.1)
                 continue
 
-            self.last_total_samples = total
-
-            # Cap advance (mirrors real engine's dropped audio logic)
+            # Clamp advance — only commit what we actually infer.
             if max_advance_samples > 0 and new_samples > max_advance_samples:
-                dropped = (new_samples - max_advance_samples) * 1000.0 / 16000.0
-                self.dropped_audio_ms_total += dropped
                 new_samples = max_advance_samples
+            self.last_total_samples += new_samples
 
             # Failure injection
             if self.fail_after_n_jobs >= 0 and self.jobs >= self.fail_after_n_jobs:
@@ -195,7 +193,6 @@ class FakeInferenceEngine:
             rms = float(np.sqrt(np.mean(new_audio**2))) if new_audio.size > 0 else 0.0
 
             n_frames = max(1, int(round((new_samples / 16000.0) * self.args.fps)))
-            n_frames = min(n_frames, max(1, self.args.max_tail_frames))
 
             # Only publish animated frames if audio energy exceeds threshold
             if rms >= self.energy_threshold:

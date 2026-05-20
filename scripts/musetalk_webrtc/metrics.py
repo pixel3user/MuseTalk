@@ -151,5 +151,6 @@ async def metrics_handler(_request) -> "web.Response":
     body = generate_latest()
     return web.Response(
         body=body,
-        content_type=CONTENT_TYPE_LATEST,
+        content_type="text/plain",
+        charset="utf-8",
     )
