@@ -125,7 +125,10 @@ class Avatar:
                         self.input_latent_list_cycle.pop(L - 1)
                         self.input_latent_list_cycle.pop(mid)
                 else:
-                    response = input(f"{self.avatar_id} exists, Do you want to re-create it ? (y/n)")
+                    if args.non_interactive:
+                        response = "n"
+                    else:
+                        response = input(f"{self.avatar_id} exists, Do you want to re-create it ? (y/n)")
                     if response.lower() == "y":
                         shutil.rmtree(self.avatar_path)
                         print("*********************************")
