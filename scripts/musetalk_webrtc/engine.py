@@ -347,6 +347,7 @@ class MuseTalkRealtimeEngine:
             
             if self.last_total_samples < 0:
                 new_samples = int(window.size)
+                self.last_total_samples = total - new_samples
             else:
                 new_samples = max(0, int(total - self.last_total_samples))
 
@@ -356,12 +357,12 @@ class MuseTalkRealtimeEngine:
                 await self.pcm_ring.wait_for_total_after(total, timeout=0.1)
                 continue
 
-            self.last_total_samples = total
-
+            # Clamp how much new audio we process per iteration.
+            # Crucially: only advance last_total_samples by what we actually infer,
+            # so excess audio is re-consumed next loop (no silent drops).
             if max_advance_samples > 0 and new_samples > max_advance_samples:
-                dropped = (new_samples - max_advance_samples) * 1000.0 / 16000.0
-                self.dropped_audio_ms_total += dropped
                 new_samples = max_advance_samples
+            self.last_total_samples += new_samples
 
             # --- VAD Filtering (Offloaded to background thread to avoid event loop stalls) ---
             new_audio = window[-new_samples:]
@@ -401,7 +402,6 @@ class MuseTalkRealtimeEngine:
                     window[-new_samples:] = 0.0
 
             new_frames = max(1, int(round((new_samples / 16000.0) * self.args.fps)))
-            new_frames = min(new_frames, max(1, self.args.max_tail_frames))
 
             try:
                 frames = await asyncio.to_thread(self._infer_window_frames, window, new_frames, new_samples)
@@ -415,7 +415,9 @@ class MuseTalkRealtimeEngine:
                 self.last_error = repr(e)
                 print(f"[engine] inference error: {e!r}")
 
-            await asyncio.sleep(0.005)
+            # No sleep — loop immediately re-checks for more audio.
+            # If none available, wait_for_total_after at top of loop blocks
+            # until new audio arrives (event-driven, not polling).
 
     def status(self) -> dict:
         """Return engine diagnostics used by `/status`.

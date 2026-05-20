@@ -7,7 +7,13 @@ import cv2
 import numpy as np
 
 class PcmRingBuffer:
-    """Thread-safe asyncio ring buffer for mono float PCM samples."""
+    """Thread-safe asyncio ring buffer for mono float PCM samples.
+
+    Uses a pre-allocated fixed-size numpy array with wrap-around write index.
+    This eliminates the np.concatenate allocation churn that caused GC pressure
+    and unpredictable latency spikes during long calls (the old implementation
+    reallocated the entire buffer ~50 times/second on 20ms audio chunks).
+    """
 
     def __init__(self, max_samples: int):
         """Create a lock-protected mono PCM ring buffer.
@@ -20,13 +26,15 @@ class PcmRingBuffer:
         """
 
         self.max_samples = max_samples
-        self.buf = np.zeros((0,), dtype=np.float32)
+        self._ring = np.zeros(max_samples, dtype=np.float32)
+        self._write_pos = 0  # next write index (wraps around)
+        self._fill = 0  # how many valid samples are in the ring (0..max_samples)
         self.total_samples = 0
         self.lock = asyncio.Lock()
         self.new_data_event = asyncio.Event()
 
     async def append(self, samples: np.ndarray) -> None:
-        """Append float PCM samples and clip to ring capacity.
+        """Append float PCM samples into the circular buffer.
 
         Receives:
         - `samples`: mono audio samples (any numeric dtype).
@@ -38,10 +46,27 @@ class PcmRingBuffer:
         if samples.size == 0:
             return
         async with self.lock:
-            self.total_samples += int(samples.size)
-            self.buf = np.concatenate([self.buf, samples.astype(np.float32, copy=False)])
-            if self.buf.size > self.max_samples:
-                self.buf = self.buf[-self.max_samples :]
+            data = samples.astype(np.float32, copy=False).ravel()
+            n = data.size
+            self.total_samples += n
+
+            if n >= self.max_samples:
+                # Input larger than ring — just keep the last max_samples
+                self._ring[:] = data[-self.max_samples:]
+                self._write_pos = 0
+                self._fill = self.max_samples
+            else:
+                # Write with wrap-around
+                end = self._write_pos + n
+                if end <= self.max_samples:
+                    self._ring[self._write_pos:end] = data
+                else:
+                    first = self.max_samples - self._write_pos
+                    self._ring[self._write_pos:] = data[:first]
+                    self._ring[:n - first] = data[first:]
+                self._write_pos = end % self.max_samples
+                self._fill = min(self._fill + n, self.max_samples)
+
             self.new_data_event.set()
 
     async def latest(self, n_samples: int) -> tuple[np.ndarray, int]:
@@ -55,9 +80,23 @@ class PcmRingBuffer:
         """
 
         async with self.lock:
-            if self.buf.size <= n_samples:
-                return self.buf.copy(), self.total_samples
-            return self.buf[-n_samples:].copy(), self.total_samples
+            available = self._fill
+            want = min(n_samples, available)
+            if want == 0:
+                return np.zeros((0,), dtype=np.float32), self.total_samples
+
+            # The newest 'want' samples end at _write_pos (exclusive)
+            start = (self._write_pos - want) % self.max_samples
+            if start + want <= self.max_samples:
+                out = self._ring[start:start + want].copy()
+            else:
+                # Wraps around the boundary
+                first = self.max_samples - start
+                out = np.concatenate([
+                    self._ring[start:],
+                    self._ring[:want - first],
+                ])
+            return out, self.total_samples
 
     async def wait_for_total_after(self, total_samples: int, timeout: float) -> bool:
         """Wait until the cumulative sample counter advances past `total_samples`.

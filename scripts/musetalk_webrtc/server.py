@@ -8,7 +8,7 @@ import json
 import secrets
 import time
 import uuid
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import urlencode
 
 import cv2
@@ -17,8 +17,13 @@ from aiohttp import web
 from scipy.signal import resample_poly
 
 from .buffers import AudioTrackBuffer, PcmRingBuffer, VideoFrameBuffer
-from .constants import SESSION_TOKEN_HEADER
-from .engine import MuseTalkRealtimeEngine
+from .constants import (
+    IDEMPOTENCY_CACHE_MAX_ENTRIES,
+    IDEMPOTENCY_KEY_HEADER,
+    IDEMPOTENCY_TTL_SECONDS,
+    SESSION_TOKEN_HEADER,
+)
+from .engine_protocol import InferenceEngine
 from .models import AppArgs, SessionState
 from .personaplex_io import PersonaPlexChatBridge, PersonaPlexMirrorClient
 from .rtc import (
@@ -29,16 +34,41 @@ from .rtc import (
     RTCSessionDescription,
 )
 from .tracks import MuseTalkAudioTrack, MuseTalkVideoTrack
+from .metrics import METRICS, metrics_handler
 from .web_ui import HTML_PAGE
+
+
+def _default_engine_factory(
+    args: AppArgs,
+    pcm_ring_16k: PcmRingBuffer,
+    video_buffer: VideoFrameBuffer,
+) -> InferenceEngine:
+    """Default engine factory that imports and constructs the real GPU engine.
+
+    This function performs the heavy `from .engine import MuseTalkRealtimeEngine`
+    lazily, so that tests injecting a FakeInferenceEngine never trigger torch
+    import or GPU initialization.
+    """
+    from .engine import MuseTalkRealtimeEngine
+
+    return MuseTalkRealtimeEngine(args=args, pcm_ring_16k=pcm_ring_16k, video_buffer=video_buffer)
 
 class WebRtcApp:
     """Aiohttp app state container for signaling, sessions, and media bridges."""
 
-    def __init__(self, args: AppArgs):
+    def __init__(
+        self,
+        args: AppArgs,
+        *,
+        engine_factory: Optional[Callable[..., InferenceEngine]] = None,
+    ):
         """Build buffers, optional clients, and runtime state.
 
         Receives:
         - `args`: validated runtime config.
+        - `engine_factory`: optional callable(args, pcm_ring_16k, video_buffer) -> InferenceEngine.
+          Defaults to _default_engine_factory which imports the real GPU engine.
+          Pass engines.fake.FakeInferenceEngine for GPU-free testing.
 
         Returns:
         - `None`.
@@ -58,6 +88,12 @@ class WebRtcApp:
         }
         self.debug_events: list[dict[str, Any]] = []
         self.debug_events_limit = max(25, int(args.debug_events_limit))
+        self._healthy = True  # Set to False if a critical task dies unexpectedly
+
+        # Idempotency cache for /offer retries: maps idempotency key to
+        # {"payload": <answer_dict>, "expires_at": <epoch>}. Keys are bounded
+        # by IDEMPOTENCY_CACHE_MAX_ENTRIES via LRU-ish trimming on insert.
+        self._idempotency_cache: dict[str, dict[str, Any]] = {}
 
         ring_samples = int(args.ring_buffer_seconds * 24000)
         self.pcm_ring_24k = PcmRingBuffer(max_samples=ring_samples)
@@ -66,7 +102,7 @@ class WebRtcApp:
         self.video_buffer = VideoFrameBuffer(maxsize=args.video_queue_size)
 
         self.mirror_client: Optional[PersonaPlexMirrorClient] = None
-        self.engine: Optional[MuseTalkRealtimeEngine] = None
+        self.engine: Optional[InferenceEngine] = None
         if not args.web_test_only:
             if (not args.musetalk_only) and (not self._personaplex_chat_enabled()):
                 ws_url = self._build_mirror_ws_url()
@@ -78,11 +114,8 @@ class WebRtcApp:
                     status_json=args.status_json,
                     reconnect_delay_seconds=args.reconnect_delay_seconds,
                 )
-            self.engine = MuseTalkRealtimeEngine(
-                args=args,
-                pcm_ring_16k=self.pcm_ring_16k,
-                video_buffer=self.video_buffer,
-            )
+            factory = engine_factory or _default_engine_factory
+            self.engine = factory(args, self.pcm_ring_16k, self.video_buffer)
         else:
             self._seed_web_test_frame()
 
@@ -172,6 +205,52 @@ class WebRtcApp:
                 return body
         return {}
 
+    def _idempotency_lookup(self, key: str) -> Optional[dict[str, Any]]:
+        """Return cached answer payload for `key` if present and not expired.
+
+        Returns the stored payload dict (suitable for json_response) or None.
+        Side effect: removes expired entries encountered during lookup.
+        """
+        if not key:
+            return None
+        entry = self._idempotency_cache.get(key)
+        if entry is None:
+            return None
+        if entry["expires_at"] <= time.time():
+            self._idempotency_cache.pop(key, None)
+            return None
+        return entry["payload"]
+
+    def _idempotency_store(self, key: str, payload: dict[str, Any]) -> None:
+        """Cache `payload` under `key` for IDEMPOTENCY_TTL_SECONDS.
+
+        Keeps the cache bounded: if it exceeds IDEMPOTENCY_CACHE_MAX_ENTRIES,
+        we drop the oldest expired entries first, then the oldest in general.
+        """
+        if not key:
+            return
+        now = time.time()
+        # Bound the cache. Cheap O(N) sweep on insert is fine because
+        # the cache is small (a few hundred entries at most) and inserts
+        # happen on the order of /offer requests, not per audio frame.
+        if len(self._idempotency_cache) >= IDEMPOTENCY_CACHE_MAX_ENTRIES:
+            # First pass: drop expired
+            expired = [k for k, v in self._idempotency_cache.items() if v["expires_at"] <= now]
+            for k in expired:
+                self._idempotency_cache.pop(k, None)
+            # Still over? Drop oldest by expires_at.
+            if len(self._idempotency_cache) >= IDEMPOTENCY_CACHE_MAX_ENTRIES:
+                victims = sorted(
+                    self._idempotency_cache.items(),
+                    key=lambda kv: kv[1]["expires_at"],
+                )[: max(1, IDEMPOTENCY_CACHE_MAX_ENTRIES // 4)]
+                for k, _ in victims:
+                    self._idempotency_cache.pop(k, None)
+        self._idempotency_cache[key] = {
+            "payload": payload,
+            "expires_at": now + IDEMPOTENCY_TTL_SECONDS,
+        }
+
     def _touch_session(self, session: SessionState) -> None:
         """Refresh session activity timestamp."""
 
@@ -194,6 +273,19 @@ class WebRtcApp:
         state = self._session_state(session)
         if session.pc is None and age > max(1.0, self.args.session_offer_timeout_seconds):
             return True, "offer_timeout"
+
+        # Disconnect grace period: if ICE went 'disconnected' and didn't
+        # recover within session_disconnect_grace_seconds, close the session
+        # so the client re-offers cleanly. This is the production fix for
+        # "mobile users get stuck after WiFi/LTE handoff".
+        #
+        # NOTE: disconnected_at is only set/cleared by the connectionstatechange
+        # handler in _handle_offer; sessions that never reached 'connected'
+        # use the older offer_timeout/idle path above.
+        grace = max(1.0, float(self.args.session_disconnect_grace_seconds))
+        if session.disconnected_at > 0 and (now - session.disconnected_at) > grace:
+            return True, "disconnect_grace_exceeded"
+
         if state in {"closed", "failed", "disconnected"}:
             idle = now - session.last_activity_epoch
             if idle > max(5.0, self.args.session_cleanup_interval_seconds * 2.0):
@@ -311,9 +403,31 @@ class WebRtcApp:
         )
         if self.mirror_client is not None and self.args.input_source in ("mirror", "mixed"):
             self.mirror_task = asyncio.create_task(self.mirror_client.run())
+            self.mirror_task.add_done_callback(
+                lambda t: self._on_critical_task_done(t, "mirror")
+            )
         if self.engine is not None:
             self.engine_task = asyncio.create_task(self.engine.run())
+            self.engine_task.add_done_callback(
+                lambda t: self._on_critical_task_done(t, "engine")
+            )
         self.session_cleanup_task = asyncio.create_task(self._session_cleanup_loop())
+
+    def _on_critical_task_done(self, task: asyncio.Task, name: str) -> None:
+        """Callback for critical background tasks: mark unhealthy on unexpected death."""
+        if task.cancelled():
+            # Cancelled during shutdown — expected, no action needed.
+            return
+        exc = task.exception()
+        if exc is not None:
+            self._healthy = False
+            self._debug(
+                "task.critical_failure",
+                task_name=name,
+                error=repr(exc),
+                healthy=False,
+            )
+            print(f"[CRITICAL] Task '{name}' died unexpectedly: {exc!r}. Server marked unhealthy.")
 
     async def on_cleanup(self, _app: web.Application):
         """Aiohttp cleanup hook: stop tasks, close sessions, close peers."""
@@ -418,18 +532,74 @@ class WebRtcApp:
         return web.Response(body=data, content_type="image/jpeg")
 
     async def healthz(self, _request: web.Request) -> web.Response:
-        """Lightweight liveness/readiness endpoint."""
+        """Lightweight liveness endpoint. Returns 503 if a critical task has died.
+
+        Use this for Kubernetes livenessProbe / serverless platform health checks.
+        It answers: "Is the process fundamentally alive?"
+        """
 
         await self._expire_stale_sessions()
-        return web.json_response(
-            {
-                "ok": True,
-                "aiortc_available": AIORTC_AVAILABLE,
-                "uptime_seconds": round(time.time() - self.started_epoch, 1),
-                "active_session_id": self.active_session_id,
-                "session_count": len(self.sessions),
-            }
-        )
+        payload = {
+            "ok": self._healthy,
+            "aiortc_available": AIORTC_AVAILABLE,
+            "uptime_seconds": round(time.time() - self.started_epoch, 1),
+            "active_session_id": self.active_session_id,
+            "session_count": len(self.sessions),
+            "healthy": self._healthy,
+        }
+        status_code = 200 if self._healthy else 503
+        return web.json_response(payload, status=status_code)
+
+    async def readyz(self, _request: web.Request) -> web.Response:
+        """Readiness endpoint. Returns 503 until models are warm and pipeline is functional.
+
+        Use this for Kubernetes readinessProbe / serverless platform readiness gates.
+        It answers: "Should traffic be routed to this instance?"
+
+        Conditions for ready=True:
+        1. Process is healthy (no critical task has died).
+        2. Engine has published at least one frame (models loaded + warmup done).
+           - In web_test_only mode, always ready (no engine).
+        3. If using mirror mode, mirror client has connected at least once.
+           - In chat/musetalk-only mode, mirror is not required.
+
+        This prevents the serverless platform from routing /offer requests
+        before the GPU models are loaded, which was a major source of
+        "sometimes works on cold start" failures.
+        """
+
+        reasons: list[str] = []
+
+        # Condition 1: process alive
+        if not self._healthy:
+            reasons.append("unhealthy: critical task has died")
+
+        # Condition 2: engine warm (has published at least one frame)
+        if self.engine is not None:
+            if not hasattr(self.engine, "last_publish_epoch") or self.engine.last_publish_epoch == 0.0:
+                # Engine exists but hasn't produced any output yet → still warming up
+                # Check if it has a 'ready' event (FakeEngine has this; real engine
+                # signals readiness by publishing its first frame)
+                engine_ready = getattr(self.engine, "ready", None)
+                if engine_ready is not None and hasattr(engine_ready, "is_set"):
+                    if not engine_ready.is_set():
+                        reasons.append("engine: not ready (warming up)")
+                elif self.engine.last_publish_epoch == 0.0:
+                    reasons.append("engine: no frames published yet (warming up)")
+
+        # Condition 3: mirror connected (if applicable)
+        if self.mirror_client is not None and self.args.input_source in ("mirror", "mixed"):
+            if not self.mirror_client.connected and self.mirror_client.packets == 0:
+                reasons.append("mirror: never connected to PersonaPlex")
+
+        ready = len(reasons) == 0
+        payload = {
+            "ready": ready,
+            "reasons": reasons if not ready else [],
+            "uptime_seconds": round(time.time() - self.started_epoch, 1),
+        }
+        status_code = 200 if ready else 503
+        return web.json_response(payload, status=status_code)
 
     async def config_v1(self, _request: web.Request) -> web.Response:
         """Return v1 API metadata including token header contract."""
@@ -442,6 +612,12 @@ class WebRtcApp:
                 "auth_enabled": self.args.enable_api_auth,
             }
         )
+
+    async def _metrics_handler(self, request: web.Request) -> web.Response:
+        """Serve Prometheus metrics at /metrics."""
+        # Update session gauge before serving
+        METRICS.sessions_active.set(len(self.sessions))
+        return await metrics_handler(request)
 
     async def active_session(self, _request: web.Request) -> web.Response:
         """Return current active session payload, if any."""
@@ -479,6 +655,12 @@ class WebRtcApp:
         )
         self.sessions[session.session_id] = session
         self.active_session_id = session.session_id
+        # Reset video buffer so new session doesn't replay stale frames
+        while not self.video_buffer.queue.empty():
+            try:
+                self.video_buffer.queue.get_nowait()
+            except Exception:
+                break
         self._debug("session.created", session_id=session.session_id)
         return session
 
@@ -630,16 +812,47 @@ class WebRtcApp:
         print(f"[personaplex-chat] started for session={session.session_id} url={ws_url}")
 
     async def offer(self, request: web.Request) -> web.Response:
-        """Legacy offer endpoint that auto-creates session and returns answer."""
+        """Legacy offer endpoint that auto-creates session and returns answer.
+
+        Supports idempotency: if the request includes an `x-idempotency-key`
+        header AND a cached answer exists for that key, returns the cached
+        answer instead of creating a new session. This prevents fetch retries
+        on flaky networks from churning sessions in single-session mode.
+        """
 
         await self._expire_stale_sessions()
+        METRICS.offers_total.inc()
+
+        # Idempotency check FIRST, before any session creation/close.
+        idempotency_key = request.headers.get(IDEMPOTENCY_KEY_HEADER, "").strip()
+        cached = self._idempotency_lookup(idempotency_key)
+        if cached is not None:
+            self._debug(
+                "offer.idempotent_hit",
+                remote=request.remote or "",
+                key_prefix=idempotency_key[:8],
+            )
+            return web.json_response(cached)
+
         self._debug("offer.legacy.request", remote=request.remote or "")
         if self.args.single_session_mode:
             active = self._active_session()
             if active is not None:
                 await self._close_session(active, reason="legacy_offer_replaced")
         session = self._create_session()
-        return await self._handle_offer(request, session=session, include_session_token=True)
+        response = await self._handle_offer(
+            request, session=session, include_session_token=True
+        )
+
+        # Cache the answer for IDEMPOTENCY_TTL_SECONDS so retries return the
+        # same payload. We extract the JSON body from the response object.
+        if idempotency_key and response.status == 200:
+            with contextlib.suppress(Exception):
+                # response.body is bytes for json_response; round-trip via json.
+                payload = json.loads(response.body)
+                self._idempotency_store(idempotency_key, payload)
+
+        return response
 
     async def session_offer(self, request: web.Request) -> web.Response:
         """Session-bound offer endpoint (`/v1/sessions/{id}/offer`)."""
@@ -728,7 +941,29 @@ class WebRtcApp:
                 pcid=pcid,
                 state=pc.connectionState,
             )
-            if pc.connectionState in ("failed", "closed"):
+            if pc.connectionState == "disconnected":
+                # Instrument disconnect timestamp for observability.
+                # Does NOT close the session yet — allows ICE reconnection.
+                session.disconnected_at = time.time()
+                self._debug(
+                    "webrtc.disconnected",
+                    session_id=session.session_id,
+                    pcid=pcid,
+                    hint="awaiting ICE reconnection or grace timeout",
+                )
+            elif pc.connectionState == "connected":
+                # Clear disconnect tracking on successful reconnect.
+                if session.disconnected_at > 0:
+                    reconnect_ms = round((time.time() - session.disconnected_at) * 1000, 1)
+                    self._debug(
+                        "webrtc.reconnected",
+                        session_id=session.session_id,
+                        pcid=pcid,
+                        reconnect_ms=reconnect_ms,
+                    )
+                session.disconnected_at = 0.0
+            elif pc.connectionState in ("failed", "closed"):
+                session.disconnected_at = 0.0
                 await pc.close()
                 self.pcs.discard(pc)
                 self.pc_states[pcid] = "closed"
@@ -771,7 +1006,7 @@ class WebRtcApp:
         await pc.setRemoteDescription(offer)
         answer = await pc.createAnswer()
         await pc.setLocalDescription(answer)
-        await self._wait_for_ice_gathering(pc, timeout=3.0)
+        await self._wait_for_ice_gathering(pc, timeout=self.args.ice_gather_timeout_seconds)
         self._debug("offer.answer_ready", session_id=session.session_id, pcid=pcid)
 
         payload = {
@@ -904,6 +1139,8 @@ class WebRtcApp:
         app.on_cleanup.append(self.on_cleanup)
         app.router.add_get("/", self.index)
         app.router.add_get("/healthz", self.healthz)
+        app.router.add_get("/readyz", self.readyz)
+        app.router.add_get("/metrics", self._metrics_handler)
         app.router.add_get("/config", self.config)
         app.router.add_get("/status", self.status)
         app.router.add_get("/snapshot.jpg", self.snapshot)

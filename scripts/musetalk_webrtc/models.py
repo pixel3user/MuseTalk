@@ -71,6 +71,8 @@ class AppArgs:
     session_offer_timeout_seconds: float
     session_max_age_seconds: float
     session_cleanup_interval_seconds: float
+    session_disconnect_grace_seconds: float
+    ice_gather_timeout_seconds: float
     single_session_mode: bool
     web_test_only: bool
     debug: bool
@@ -109,3 +111,4 @@ class SessionState:
     personaplex_bridge: Optional["PersonaPlexChatBridge"] = None
     personaplex_bridge_task: Optional[asyncio.Task] = None
     close_reason: str = ""
+    disconnected_at: float = 0.0  # epoch when pc entered 'disconnected'; 0 = never/recovered
