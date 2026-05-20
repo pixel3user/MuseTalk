@@ -655,6 +655,12 @@ class WebRtcApp:
         )
         self.sessions[session.session_id] = session
         self.active_session_id = session.session_id
+        # Reset video buffer so new session doesn't replay stale frames
+        while not self.video_buffer.queue.empty():
+            try:
+                self.video_buffer.queue.get_nowait()
+            except Exception:
+                break
         self._debug("session.created", session_id=session.session_id)
         return session
 

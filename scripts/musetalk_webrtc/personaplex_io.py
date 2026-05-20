@@ -245,6 +245,12 @@ class PersonaPlexChatBridge:
                 self.handshake.set()
                 self.handshake_epoch = time.time()
                 self.session.personaplex_connected = True
+                # Flush any stale audio that accumulated during handshake wait
+                while not self.uplink_queue.empty():
+                    try:
+                        self.uplink_queue.get_nowait()
+                    except Exception:
+                        break
                 if self.debug_log is not None:
                     self.debug_log(
                         "personaplex_chat.handshake",
